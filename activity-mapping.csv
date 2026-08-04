@@ -1,0 +1,55 @@
+jobadder_type,jobadder_source,classification,reason
+Outbound Call,*,CALL,Genuine outbound telephone activity
+Inbound Call,*,CALL,Genuine inbound telephone activity
+Phone call,*,CALL,Telephone activity
+Phone call - KIT Client Call (Keep in Touch),*,CALL,Keep-in-touch telephone activity
+Missed Call,*,CALL,Telephone activity
+Left message,*,CALL,Telephone attempt
+Left message OR No Answer,*,CALL,Telephone attempt
+Client Relationship Call (CRC),Note,CALL,Relationship telephone activity
+Intro Business Call,*,CALL,Introductory telephone activity
+Intro New Business Client Relationship Call,*,CALL,Introductory telephone activity
+Email sent,Email,OUTBOUND_EMAIL,Email source and sent type
+Sent email,Email,OUTBOUND_EMAIL,Email source and sent type
+Sent email,Note,OUTBOUND_EMAIL,SourceWhale or manually captured outbound email
+Email Received,Email,INBOUND_EMAIL,Samples confirm received email
+Received email,Email,INBOUND_EMAIL,Received email
+Received email,Note,INBOUND_EMAIL,SourceWhale or manually captured received email
+Email Reply,Email,OUTBOUND_EMAIL,Reply sent by Sapture to the contact
+Email Reply,Note,OUTBOUND_EMAIL,Reply sent by Sapture to the contact
+LinkedIn InMail / LinkedIn Other,*,NOTE,LinkedIn interaction
+LinkedIn Inmail,*,NOTE,LinkedIn interaction
+Sent LinkedIn voice note,*,NOTE,LinkedIn interaction
+SMS Received,*,NOTE,SMS preserved as a labelled note
+SMS,*,NOTE,SMS preserved as a labelled note
+WhatsApp SMS,*,NOTE,Messaging activity preserved as a note
+Update,Note,NOTE,Manual contact history
+Canvassed - Sale (Positive),Note,NOTE,Manual business development history
+Sapture Existing Client Meeting - Booked,Note,NOTE,Meeting details are not reliably structured
+New Client Meeting - Booked,Note,NOTE,Meeting details are not reliably structured
+Meeting Booked,Note,NOTE,Meeting details are not reliably structured
+Sapture Meeting Attended - Notes,Note,NOTE,Manual meeting history
+Meeting Attended with Notes,Note,NOTE,Manual meeting history
+New Business Development Meeting,Note,NOTE,Manual meeting history
+Quil,Note,NOTE,Call summary retained as a note
+Float Candidate(s),Note,NOTE,Candidate-submission history retained on the contact
+ROI-AI,*,EXCLUDE,Automated campaign or tracking activity
+Roi-AI Email Sent,*,EXCLUDE,Automated campaign activity
+ROI Newsletter Sent,*,EXCLUDE,Automated newsletter activity
+S/4HANA Survey Email opened & Clicked,*,EXCLUDE,Automated tracking activity
+Status Change,*,EXCLUDE,Administrative record history
+Qualified Prospect,Status,EXCLUDE,Administrative status history
+Unqualified Prospect,Status,EXCLUDE,Administrative status history
+Dead Prospect,Status,EXCLUDE,Administrative status history
+Hot Prospect,Status,EXCLUDE,Administrative status history
+Working Prospect,Status,EXCLUDE,Administrative status history
+Contact Moved,*,EXCLUDE,Administrative record history
+Contact Merge,*,EXCLUDE,Administrative record history
+Spreadsheet Import,*,EXCLUDE,Administrative import history
+Quality Lead Pulled,*,EXCLUDE,Internal workflow activity
+Pre-Lead Pulled,*,EXCLUDE,Internal workflow activity
+Manager Names,*,EXCLUDE,Internal workflow activity
+Lusha / Seek / LI No Details,*,EXCLUDE,Internal data-enrichment workflow
+Lusha Details,*,EXCLUDE,Internal data-enrichment workflow
+Document Sent,Document,EXCLUDE,Document audit event
+Document Signed,Document,EXCLUDE,Document audit event
