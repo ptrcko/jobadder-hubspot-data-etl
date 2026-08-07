@@ -18,7 +18,19 @@ The current exclusive cutoff is `2026-06-23T00:00:00Z`: only activity before tha
 
 CSV files are the primary bulk-creation mechanism. HubSpot APIs are used for contact resolution, read-only deduplication, and post-import reconciliation—not as an excuse to create contacts.
 
-A separate local migration ledger must track every source activity, contact match, deduplication result, batch membership, import result, retry, exclusion, and manual decision. After matching, **Contact Record ID** is the preferred CSV association identifier. Email is only a fallback discovery key and must not become the default import association when a Record ID is known.
+A separate local migration ledger tracks every source activity, contact match,
+deduplication result, batch membership, import result, retry, exclusion, and
+manual decision. The chosen CSV association identifier is the contact's
+**normalized exact email**. Planning trims surrounding whitespace, case-folds
+the address, validates its structure, and hashes that normalized value for the
+privacy-safe ledger. Blank or invalid addresses become `unmatched_contact` and
+cannot enter a batch.
+
+HubSpot's contact-email uniqueness is only an association mechanism. It says
+nothing about whether an activity was previously imported. Replay protection
+comes from the local ledger's composite source key, immutable batch ID, CSV and
+row hashes, row-level manifest, and ordered `planned` / `reviewed` / `submitted`
+/ `imported` states. Never replay a CSV based on email uniqueness.
 
 The migration work item is an activity/contact association identified by the
 composite key **`organisation_id + source_activity_id + source_contact_id`**.
@@ -92,7 +104,7 @@ Generate new files (the command refuses to overwrite either output):
 
 ```bash
 python migration_ledger.py generate-batch jobadder-history.db migration-ledger.db \
-  reviewed-batch.csv reviewed-batch.audit.json
+  reviewed-batch.csv reviewed-batch.audit.json --batch-id reviewed-2026-001
 ```
 
 The audit manifest is a review and reconciliation sidecar only. Never submit it
@@ -128,12 +140,12 @@ python migration_ledger.py discover jobadder-history.db migration-ledger.db \
 ```
 
 A link whose JobAdder contact has no email is retained as
-`unmatched_contact`, with reason
-`source_contact_has_no_email_and_is_not_in_hubspot`. The ledger preserves the
+`unmatched_contact`, with reason `source_contact_has_no_email`; an invalid
+address uses `source_contact_has_invalid_email`. The ledger preserves the
 source contact/activity IDs, type, timestamp, mapping decision/reason and
 mapping fingerprint, but its schema deliberately has no contact-address field.
-The import-candidate boundary only returns links with an approved contact match,
-a pre-existing HubSpot Contact Record ID, and an importable mapping decision;
+The import-candidate boundary only returns links with a validated exact-email
+association (and, where applicable, an approved shared-email policy) plus an importable mapping decision;
 therefore unresolved links cannot enter a generated HubSpot CSV.
 
 Both batch previews and final reconciliation reports include privacy-safe counts
@@ -146,18 +158,35 @@ python migration_ledger.py preview migration-ledger.db batch-preview.json
 python migration_ledger.py reconcile migration-ledger.db final-reconciliation.json
 ```
 
-If a separate, operator-owned process later creates those contacts in HubSpot,
-an operator may prepare a reviewed CSV containing only
-`source_contact_id,hubspot_contact_id` and explicitly reconsider the links:
+## Shared source emails
+
+Planning compares normalized addresses across source contact IDs. If multiple
+JobAdder contact IDs share one normalized email, all of their rows become
+`shared_email_exception` before production batch generation. Preview and
+reconciliation JSON include an exception report containing the source contact
+IDs and a SHA-256 email reference—never the address itself.
+
+An operator must document and review a policy CSV with
+`email_sha256,decision`, where the decision is `approve_import` or `exclude`.
+No shared-email row is eligible until the explicit confirmation is supplied:
 
 ```bash
-python migration_ledger.py reconsider-unmatched migration-ledger.db approved-matches.csv \
-  --confirm-contacts-already-exist-in-hubspot
+python migration_ledger.py decide-shared-emails migration-ledger.db shared-policy.csv \
+  --confirm-reviewed-policy
 ```
 
-The confirmation is mandatory and the match file must contain nonblank IDs.
-This command only records approved associations and state transitions. It has no
-HubSpot API write path and never creates, updates, merges, or deletes contacts.
+This command only records the policy outcome. It has no HubSpot API write path
+and never creates, updates, merges, or deletes contacts.
+
+After reviewing a generated manifest, record state transitions separately from
+any import submission. Submission and reconciliation states require the portal's
+import ID:
+
+```bash
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 reviewed
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 submitted --import-id 12345
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 imported --import-id 12345
+```
 
 A batch with an unknown or partial import outcome must be reconciled before any retry. Never regenerate and blindly replay it. Generated files are immutable: any correction creates a new batch with a new manifest and hashes.
 
