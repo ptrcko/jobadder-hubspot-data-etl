@@ -18,6 +18,8 @@ from migration_ledger import (
     normalize_email,
     open_ledger,
     record_batch_state,
+    reconcile_manual_import,
+    record_stronger_confirmation,
     write_report,
 )
 from hubspot_history_audit import open_read_only
@@ -210,15 +212,78 @@ class MigrationLedgerTests(unittest.TestCase):
         record_batch_state(self.ledger, "batch-1", "reviewed", reviewer="Synthetic Reviewer")
         with self.assertRaises(ValueError):
             record_batch_state(self.ledger, "batch-1", "submitted")
-        record_batch_state(self.ledger, "batch-1", "submitted", "import-1")
-        record_batch_state(self.ledger, "batch-1", "imported", "import-1")
+        with self.assertRaises(ValueError):
+            record_batch_state(self.ledger, "batch-1", "submitted", "import-1")
+        record_batch_state(self.ledger, "batch-1", "submitted", "import-1",
+                           operator="Synthetic Operator")
         ledger = open_ledger(self.ledger)
         self.assertEqual(ledger.execute(
             "SELECT status FROM batches WHERE batch_id='batch-1'"
-        ).fetchone()[0], "imported")
+        ).fetchone()[0], "submitted")
         self.assertEqual({row[0] for row in ledger.execute(
             "SELECT state FROM batch_rows WHERE batch_id='batch-1'"
-        )}, {"imported"})
+        )}, {"submitted"})
+        ledger.close()
+
+    def test_manual_import_confirms_only_when_totals_and_error_rows_reconcile(self):
+        source = sqlite3.connect(self.source)
+        source.execute("INSERT INTO JobAdderContacts VALUES (12, 'second@example.test', 1)")
+        source.execute("INSERT INTO JobAdderNotes VALUES (102, 1002, 'Phone Call', 'User', 'synthetic', 3000, 1)")
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1002, 12, 1)")
+        source.commit()
+        source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        batch = Path(self.temp.name) / "batch"
+        generate_batch(self.source, self.ledger, batch, "batch-1")
+        record_batch_state(self.ledger, "batch-1", "reviewed", reviewer="Reviewer")
+        record_batch_state(self.ledger, "batch-1", "submitted", import_name="manual-1",
+                           operator="Operator")
+        errors = Path(self.temp.name) / "errors.csv"
+        errors.write_text("Row Number,Error\n2,Synthetic rejection\n", encoding="utf-8")
+        outcome = reconcile_manual_import(
+            self.ledger, "batch-1", reported_successful=1, reported_failed=1,
+            checked_by="Checker", error_files=[errors],
+            evidence_directory=Path(self.temp.name) / "evidence")
+        self.assertEqual(outcome, "confirmed_by_import")
+        ledger = open_ledger(self.ledger)
+        rows = dict(ledger.execute(
+            "SELECT csv_row_number, state FROM batch_rows WHERE batch_id='batch-1'"))
+        self.assertEqual(rows, {2: "rejected", 3: "confirmed_by_import"})
+        self.assertIsNone(ledger.execute(
+            "SELECT hubspot_activity_id FROM batch_rows WHERE csv_row_number=3").fetchone()[0])
+        evidence = ledger.execute("SELECT * FROM import_error_files").fetchone()
+        self.assertEqual(len(evidence["file_sha256"]), 64)
+        self.assertTrue(Path(evidence["stored_file"]).exists())
+        ledger.close()
+
+    def test_unmatched_manual_import_evidence_requires_reconciliation(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        generate_batch(self.source, self.ledger, Path(self.temp.name) / "batch", "batch-1")
+        record_batch_state(self.ledger, "batch-1", "reviewed", reviewer="Reviewer")
+        record_batch_state(self.ledger, "batch-1", "submitted", "id-1", operator="Operator")
+        outcome = reconcile_manual_import(
+            self.ledger, "batch-1", reported_successful=2, reported_failed=1,
+            checked_by="Checker", error_files=[],
+            evidence_directory=Path(self.temp.name) / "evidence")
+        self.assertEqual(outcome, "reconciliation_required")
+        ledger = open_ledger(self.ledger)
+        self.assertEqual({r[0] for r in ledger.execute("SELECT state FROM batch_rows")},
+                         {"reconciliation_required"})
+        ledger.close()
+
+    def test_stronger_confirmation_records_sanitized_scope(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        generate_batch(self.source, self.ledger, Path(self.temp.name) / "batch", "batch-1")
+        selection = {"contact_reference": "sha256:synthetic", "date_from": "1970-01-01",
+                     "date_to": "1970-01-02", "activity_types": ["CALL"]}
+        record_stronger_confirmation(
+            self.ledger, "batch-1", "confirmed_by_export_sample",
+            checked_by="Checker", selection=selection,
+            observation="One synthetic row matched expected timestamp and type")
+        ledger = open_ledger(self.ledger)
+        check = ledger.execute("SELECT * FROM confirmation_checks").fetchone()
+        self.assertEqual(check["evidence_state"], "confirmed_by_export_sample")
+        self.assertEqual(json.loads(check["selection_json"]), selection)
         ledger.close()
 
     def test_selection_and_manifest_metadata_are_auditable(self):

@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 import uuid
 from collections import defaultdict
@@ -124,7 +125,8 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             csv_sha256 TEXT NOT NULL UNIQUE,
             manifest_file TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN
-                ('planned', 'reviewed', 'submitted', 'imported', 'rejected')),
+                ('planned', 'reviewed', 'submitted', 'confirmed_by_import',
+                 'reconciliation_required', 'rejected')),
             import_id TEXT,
             created_at_utc TEXT NOT NULL,
             environment TEXT NOT NULL,
@@ -149,9 +151,50 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             source_contact_id TEXT NOT NULL,
             row_sha256 TEXT NOT NULL,
             state TEXT NOT NULL CHECK(state IN
-                ('planned', 'submitted', 'imported', 'rejected')),
+                ('planned', 'submitted', 'confirmed_by_import',
+                 'confirmed_by_export_sample', 'confirmed_manually',
+                 'reconciliation_required', 'rejected')),
+            hubspot_activity_id TEXT,
             PRIMARY KEY (batch_id, csv_row_number),
             UNIQUE (organisation_id, source_activity_id, source_contact_id)
+        );
+        CREATE TABLE IF NOT EXISTS import_reconciliations (
+            id INTEGER PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+            import_id TEXT,
+            import_name TEXT,
+            submitted_at_utc TEXT NOT NULL,
+            submitted_by TEXT NOT NULL,
+            checked_at_utc TEXT NOT NULL,
+            checked_by TEXT NOT NULL,
+            reported_successful INTEGER NOT NULL,
+            reported_failed INTEGER NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN
+                ('confirmed_by_import', 'reconciliation_required')),
+            observation TEXT
+        );
+        CREATE TABLE IF NOT EXISTS import_error_files (
+            id INTEGER PRIMARY KEY,
+            reconciliation_id INTEGER NOT NULL REFERENCES import_reconciliations(id),
+            stored_file TEXT NOT NULL,
+            file_sha256 TEXT NOT NULL,
+            error_row_count INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS import_error_rows (
+            reconciliation_id INTEGER NOT NULL REFERENCES import_reconciliations(id),
+            batch_id TEXT NOT NULL,
+            csv_row_number INTEGER NOT NULL,
+            PRIMARY KEY (reconciliation_id, csv_row_number)
+        );
+        CREATE TABLE IF NOT EXISTS confirmation_checks (
+            id INTEGER PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+            evidence_state TEXT NOT NULL CHECK(evidence_state IN
+                ('confirmed_by_export_sample', 'confirmed_manually')),
+            checked_by TEXT NOT NULL,
+            checked_at_utc TEXT NOT NULL,
+            selection_json TEXT NOT NULL,
+            sanitized_observation TEXT NOT NULL
         );
         """
     )
@@ -168,10 +211,14 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         "hubspot_import_name": "TEXT", "import_started_at_utc": "TEXT",
         "import_completed_at_utc": "TEXT", "result_counts_json": "TEXT",
         "operator_notes": "TEXT",
+        "submitted_by": "TEXT",
     }
     for name, declaration in additions.items():
         if name not in existing:
             connection.execute(f"ALTER TABLE batches ADD COLUMN {name} {declaration}")
+    row_columns = {row[1] for row in connection.execute("PRAGMA table_info(batch_rows)")}
+    if "hubspot_activity_id" not in row_columns:
+        connection.execute("ALTER TABLE batch_rows ADD COLUMN hubspot_activity_id TEXT")
     return connection
 
 
@@ -653,12 +700,13 @@ def record_batch_state(ledger_path: Path, batch_id: str, state: str,
                        import_id: str | None = None, *, reviewer: str | None = None,
                        import_name: str | None = None,
                        result_counts: dict | None = None,
-                       operator_notes: str | None = None) -> None:
-    """Record review/submission/import outcomes; this performs no HubSpot write."""
+                       operator_notes: str | None = None,
+                       operator: str | None = None) -> None:
+    """Record review/submission outcomes; confirmation uses evidence commands."""
     allowed = {
         "planned": {"reviewed", "rejected"},
         "reviewed": {"submitted", "rejected"},
-        "submitted": {"imported", "rejected"},
+        "submitted": {"rejected"},
     }
     connection = open_ledger(ledger_path)
     try:
@@ -669,8 +717,11 @@ def record_batch_state(ledger_path: Path, batch_id: str, state: str,
             raise ValueError("unknown batch_id")
         if state not in allowed.get(batch["status"], set()):
             raise ValueError(f"invalid batch transition {batch['status']} -> {state}")
-        if state in {"submitted", "imported"} and not (import_id or "").strip():
-            raise ValueError("submitted/imported states require an import_id")
+        if state == "submitted" and not ((import_id or "").strip() or
+                                          (import_name or "").strip()):
+            raise ValueError("submitted state requires an import name or identifier")
+        if state == "submitted" and not (operator or "").strip():
+            raise ValueError("submitted state requires an operator")
         if state == "reviewed" and not (reviewer or "").strip():
             raise ValueError("reviewed state requires a reviewer")
         now = datetime.now(timezone.utc).isoformat()
@@ -681,23 +732,146 @@ def record_batch_state(ledger_path: Path, batch_id: str, state: str,
                    review_status=CASE WHEN ?='reviewed' THEN 'approved'
                                       WHEN ?='rejected' THEN 'rejected' ELSE review_status END,
                    hubspot_import_name=COALESCE(?, hubspot_import_name),
+                   submitted_by=COALESCE(?, submitted_by),
                    import_started_at_utc=CASE WHEN ?='submitted' THEN ?
                                               ELSE import_started_at_utc END,
-                   import_completed_at_utc=CASE WHEN ? IN ('imported','rejected') THEN ?
+                   import_completed_at_utc=CASE WHEN ?='rejected' THEN ?
                                                 ELSE import_completed_at_utc END,
                    result_counts_json=COALESCE(?, result_counts_json),
                    operator_notes=COALESCE(?, operator_notes)
                    WHERE batch_id=?""",
                 (state, (import_id or "").strip() or None,
                  (reviewer or "").strip() or None, state, state,
-                 (import_name or "").strip() or None, state, now, state, now,
+                 (import_name or "").strip() or None, (operator or "").strip() or None,
+                 state, now, state, now,
                  json.dumps(result_counts, sort_keys=True) if result_counts is not None else None,
                  operator_notes, batch_id),
             )
-            row_state = state if state in {"submitted", "imported", "rejected"} else "planned"
+            row_state = state if state in {"submitted", "rejected"} else "planned"
             connection.execute(
                 "UPDATE batch_rows SET state=? WHERE batch_id=?", (row_state, batch_id)
             )
+    finally:
+        connection.close()
+
+
+def _sanitized_text(value: str, field: str) -> str:
+    value = (value or "").strip()
+    if not value or len(value) > 1000 or "@" in value or "\n" in value or "\r" in value:
+        raise ValueError(f"{field} must be non-empty, single-line, <=1000 characters, and contain no email address")
+    return value
+
+
+def reconcile_manual_import(ledger_path: Path, batch_id: str, *,
+                            reported_successful: int, reported_failed: int,
+                            checked_by: str, error_files: list[Path],
+                            evidence_directory: Path,
+                            observation: str | None = None) -> str:
+    """Reconcile UI totals and downloaded error CSVs without inventing IDs."""
+    if reported_successful < 0 or reported_failed < 0:
+        raise ValueError("reported totals cannot be negative")
+    checker = _sanitized_text(checked_by, "checked_by")
+    note = _sanitized_text(observation, "observation") if observation else None
+    connection = open_ledger(ledger_path)
+    try:
+        batch = connection.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if batch is None or batch["status"] != "submitted":
+            raise ValueError("manual reconciliation requires a submitted batch")
+        evidence_directory.mkdir(parents=True, exist_ok=True)
+        parsed_files, error_rows = [], set()
+        aliases = {"row number", "row_number", "row", "csv row number", "csv_row_number"}
+        for source_file in error_files:
+            digest = file_fingerprint(source_file)
+            stored = evidence_directory / f"{batch_id}-{digest[:16]}.csv"
+            if not stored.exists():
+                shutil.copyfile(source_file, stored)
+                stored.chmod(0o444)
+            with source_file.open(encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                columns = {name.strip().casefold(): name for name in (reader.fieldnames or [])}
+                matches = [columns[name] for name in aliases if name in columns]
+                if len(matches) != 1:
+                    raise ValueError("each error CSV requires one unambiguous row-number column")
+                file_rows = set()
+                for item in reader:
+                    try:
+                        number = int((item[matches[0]] or "").strip())
+                    except ValueError as exc:
+                        raise ValueError("error CSV row numbers must be integers") from exc
+                    file_rows.add(number)
+                error_rows.update(file_rows)
+                parsed_files.append((stored, digest, len(file_rows)))
+        known = {row[0] for row in connection.execute(
+            "SELECT csv_row_number FROM batch_rows WHERE batch_id=?", (batch_id,))}
+        confident = (reported_successful + reported_failed == batch["row_count"] and
+                     len(error_rows) == reported_failed and error_rows.issubset(known))
+        outcome = "confirmed_by_import" if confident else "reconciliation_required"
+        now = datetime.now(timezone.utc).isoformat()
+        with connection:
+            cursor = connection.execute(
+                """INSERT INTO import_reconciliations
+                (batch_id, import_id, import_name, submitted_at_utc, submitted_by,
+                 checked_at_utc, checked_by, reported_successful, reported_failed,
+                 outcome, observation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, batch["import_id"], batch["hubspot_import_name"],
+                 batch["import_started_at_utc"], batch["submitted_by"], now, checker,
+                 reported_successful, reported_failed, outcome, note))
+            reconciliation_id = cursor.lastrowid
+            for stored, digest, count in parsed_files:
+                connection.execute("""INSERT INTO import_error_files
+                    (reconciliation_id, stored_file, file_sha256, error_row_count)
+                    VALUES (?, ?, ?, ?)""", (reconciliation_id, str(stored), digest, count))
+            for number in error_rows:
+                connection.execute("INSERT INTO import_error_rows VALUES (?, ?, ?)",
+                                   (reconciliation_id, batch_id, number))
+            connection.execute("UPDATE batches SET status=?, result_counts_json=?, import_completed_at_utc=? WHERE batch_id=?",
+                               (outcome, json.dumps({"successful": reported_successful,
+                                                    "failed": reported_failed}, sort_keys=True), now, batch_id))
+            if confident:
+                connection.execute("UPDATE batch_rows SET state='confirmed_by_import' WHERE batch_id=?", (batch_id,))
+                if error_rows:
+                    connection.executemany("UPDATE batch_rows SET state='rejected' WHERE batch_id=? AND csv_row_number=?",
+                                           [(batch_id, number) for number in error_rows])
+            else:
+                connection.execute("UPDATE batch_rows SET state='reconciliation_required' WHERE batch_id=?", (batch_id,))
+        return outcome
+    finally:
+        connection.close()
+
+
+def record_stronger_confirmation(ledger_path: Path, batch_id: str, state: str, *,
+                                 checked_by: str, selection: dict,
+                                 observation: str) -> None:
+    """Record privacy-safe export-sample or manual confirmation evidence."""
+    if state not in {"confirmed_by_export_sample", "confirmed_manually"}:
+        raise ValueError("unsupported stronger confirmation state")
+    required = {"contact_reference", "date_from", "date_to", "activity_types"}
+    if not required.issubset(selection) or not isinstance(selection["activity_types"], list):
+        raise ValueError("selection requires contact_reference, date_from, date_to, activity_types")
+    payload = json.dumps(selection, sort_keys=True)
+    if "@" in payload:
+        raise ValueError("selection must use a sanitized contact reference, not an address")
+    connection = open_ledger(ledger_path)
+    try:
+        if not connection.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone():
+            raise ValueError("unknown batch_id")
+        with connection:
+            connection.execute("""INSERT INTO confirmation_checks
+                (batch_id, evidence_state, checked_by, checked_at_utc,
+                 selection_json, sanitized_observation) VALUES (?, ?, ?, ?, ?, ?)""",
+                (batch_id, state, _sanitized_text(checked_by, "checked_by"),
+                 datetime.now(timezone.utc).isoformat(), payload,
+                 _sanitized_text(observation, "observation")))
+            row_numbers = selection.get("csv_row_numbers", [])
+            if row_numbers:
+                known = {row[0] for row in connection.execute(
+                    "SELECT csv_row_number FROM batch_rows WHERE batch_id=?", (batch_id,))}
+                if any(not isinstance(number, int) or number not in known
+                       for number in row_numbers):
+                    raise ValueError("csv_row_numbers must identify rows in the batch")
+                connection.executemany(
+                    "UPDATE batch_rows SET state=? WHERE batch_id=? AND csv_row_number=?",
+                    [(state, batch_id, number) for number in set(row_numbers)])
     finally:
         connection.close()
 
@@ -738,12 +912,29 @@ def parse_args() -> argparse.Namespace:
     state = commands.add_parser("record-batch-state")
     state.add_argument("ledger", type=Path)
     state.add_argument("batch_id")
-    state.add_argument("state", choices=("reviewed", "submitted", "imported", "rejected"))
+    state.add_argument("state", choices=("reviewed", "submitted", "rejected"))
     state.add_argument("--import-id")
     state.add_argument("--import-name")
     state.add_argument("--reviewer")
     state.add_argument("--result-counts-json", type=json.loads)
     state.add_argument("--operator-notes")
+    state.add_argument("--operator")
+    reconciliation = commands.add_parser("reconcile-manual-import")
+    reconciliation.add_argument("ledger", type=Path)
+    reconciliation.add_argument("batch_id")
+    reconciliation.add_argument("evidence_directory", type=Path)
+    reconciliation.add_argument("--successful", type=int, required=True)
+    reconciliation.add_argument("--failed", type=int, required=True)
+    reconciliation.add_argument("--checked-by", required=True)
+    reconciliation.add_argument("--error-file", type=Path, action="append", default=[])
+    reconciliation.add_argument("--observation")
+    confirmation = commands.add_parser("record-stronger-confirmation")
+    confirmation.add_argument("ledger", type=Path)
+    confirmation.add_argument("batch_id")
+    confirmation.add_argument("state", choices=("confirmed_by_export_sample", "confirmed_manually"))
+    confirmation.add_argument("--checked-by", required=True)
+    confirmation.add_argument("--selection-json", type=json.loads, required=True)
+    confirmation.add_argument("--observation", required=True)
     return parser.parse_args()
 
 
@@ -759,7 +950,17 @@ def main() -> int:
         record_batch_state(args.ledger, args.batch_id, args.state, args.import_id,
                            reviewer=args.reviewer, import_name=args.import_name,
                            result_counts=args.result_counts_json,
-                           operator_notes=args.operator_notes)
+                           operator_notes=args.operator_notes, operator=args.operator)
+    elif args.command == "reconcile-manual-import":
+        print(reconcile_manual_import(
+            args.ledger, args.batch_id, reported_successful=args.successful,
+            reported_failed=args.failed, checked_by=args.checked_by,
+            error_files=args.error_file, evidence_directory=args.evidence_directory,
+            observation=args.observation))
+    elif args.command == "record-stronger-confirmation":
+        record_stronger_confirmation(
+            args.ledger, args.batch_id, args.state, checked_by=args.checked_by,
+            selection=args.selection_json, observation=args.observation)
     else:
         selection = {
             "contact_ids": args.contact_id, "emails": args.email,
