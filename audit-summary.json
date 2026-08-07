@@ -1,0 +1,43 @@
+{
+  "generated_at_utc": "2026-07-23T03:55:40.093567+00:00",
+  "database": "C:\\Users\\patri\\Documents\\Code Projects\\Clients\\Sapture\\ActivityMigration\\jobadder-history",
+  "database_opened_read_only": true,
+  "organisation_id": 1,
+  "exclusive_cutoff": "2026-06-23T00:00:00",
+  "exclusive_cutoff_unix_milliseconds": 1782172800000,
+  "source_timestamp_storage": "detected per createdAt value",
+  "index_status": {
+    "present": [
+      "idx_contacts_org_contact",
+      "idx_notecontacts_org_contact_note",
+      "idx_notecontacts_org_note_contact",
+      "idx_notes_org_date",
+      "idx_notes_org_note"
+    ],
+    "missing": []
+  },
+  "activity_type_source_combinations": 124,
+  "classification_activity_contact_rows": {
+    "CALL": 42912,
+    "EXCLUDE": 102172,
+    "INBOUND_EMAIL": 14264,
+    "NOTE": 11001,
+    "OUTBOUND_EMAIL": 7488,
+    "REVIEW": 2321
+  },
+  "shared_activities": 3068,
+  "review_samples": 438,
+  "data_quality": {
+    "historical_contact_activity_links": 195426,
+    "links_with_missing_contact": 1337,
+    "links_with_blank_contact_email": 13931,
+    "eligible_links_with_blank_body": 850
+  },
+  "reports": [
+    "activity-types.csv",
+    "classification-summary.csv",
+    "data-quality.csv",
+    "shared-activities.csv",
+    "review-samples.csv"
+  ]
+}
