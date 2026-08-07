@@ -38,6 +38,15 @@ IMPORTABLE_MAPPING_DECISIONS = {"CALL", "OUTBOUND_EMAIL", "INBOUND_EMAIL", "NOTE
 CSV_FIELDS = ["Contact email", "Activity type", "Activity timestamp", "Activity body"]
 
 
+def file_fingerprint(path: Path) -> str:
+    """Hash source bytes without ever opening the source database writable."""
+    digest = hashlib.sha256()
+    with path.expanduser().resolve().open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def normalize_email(value: str | None) -> str | None:
     """Return the exact-association form, or None for blank/invalid input."""
     candidate = (value or "").strip().casefold()
@@ -117,7 +126,20 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             status TEXT NOT NULL CHECK(status IN
                 ('planned', 'reviewed', 'submitted', 'imported', 'rejected')),
             import_id TEXT,
-            created_at_utc TEXT NOT NULL
+            created_at_utc TEXT NOT NULL,
+            environment TEXT NOT NULL,
+            target_portal_label TEXT NOT NULL,
+            selection_filters_json TEXT NOT NULL,
+            mapping_hash TEXT NOT NULL,
+            source_data_fingerprint TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            reviewer TEXT,
+            review_status TEXT NOT NULL DEFAULT 'pending',
+            hubspot_import_name TEXT,
+            import_started_at_utc TEXT,
+            import_completed_at_utc TEXT,
+            result_counts_json TEXT,
+            operator_notes TEXT
         );
         CREATE TABLE IF NOT EXISTS batch_rows (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -133,6 +155,23 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         );
         """
     )
+    # Upgrade ledgers created by earlier versions without rewriting history.
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(batches)")}
+    additions = {
+        "environment": "TEXT NOT NULL DEFAULT 'unspecified'",
+        "target_portal_label": "TEXT NOT NULL DEFAULT 'unspecified'",
+        "selection_filters_json": "TEXT NOT NULL DEFAULT '{}'",
+        "mapping_hash": "TEXT NOT NULL DEFAULT ''",
+        "source_data_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "row_count": "INTEGER NOT NULL DEFAULT 0",
+        "reviewer": "TEXT", "review_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "hubspot_import_name": "TEXT", "import_started_at_utc": "TEXT",
+        "import_completed_at_utc": "TEXT", "result_counts_json": "TEXT",
+        "operator_notes": "TEXT",
+    }
+    for name, declaration in additions.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE batches ADD COLUMN {name} {declaration}")
     return connection
 
 
@@ -226,13 +265,15 @@ def discover(
                 counts["inserted" if cursor.rowcount else "already_recorded"] += 1
                 if not cursor.rowcount:
                     ledger.execute(
-                        """UPDATE activity_links SET status=?, reason_code=?
+                        """UPDATE activity_links SET status=?, reason_code=?,
+                           mapping_decision=?, mapping_reason=?, mapping_fingerprint=?
                            WHERE organisation_id=? AND source_contact_id=?
                            AND source_activity_id=?
                            AND status NOT IN ('shared_email_policy_approved',
                                               'manually_excluded', 'submitted',
                                               'confirmed', 'rejected')""",
-                        (status, reason, organisation_id,
+                        (status, reason, decision["classification"], decision["reason"],
+                         fingerprint, organisation_id,
                          str(row["source_contact_id"]),
                          str(row["source_activity_id"])),
                     )
@@ -308,7 +349,7 @@ def migration_counts(connection: sqlite3.Connection) -> dict[str, int]:
     return {key: int(row[key] or 0) for key in row.keys()}
 
 
-def importable_links(connection: sqlite3.Connection):
+def importable_links(connection: sqlite3.Connection, selection: dict | None = None):
     """Yield only links approved for normalized exact-email association.
 
     CSV generators must use this boundary rather than selecting ledger rows
@@ -316,12 +357,33 @@ def importable_links(connection: sqlite3.Connection):
     """
     status_placeholders = ",".join("?" for _ in IMPORTABLE_STATUSES)
     mapping_placeholders = ",".join("?" for _ in IMPORTABLE_MAPPING_DECISIONS)
+    selection = selection or {}
+    clauses, values = [], []
+    scalar_filters = {
+        "contact_ids": "source_contact_id", "classifications": "mapping_decision",
+        "source_types": "activity_source",
+    }
+    for key, column in scalar_filters.items():
+        chosen = selection.get(key) or []
+        if chosen:
+            clauses.append(f"{column} IN ({','.join('?' for _ in chosen)})")
+            values.extend(str(item) for item in chosen)
+    if selection.get("date_from"):
+        clauses.append("activity_timestamp >= ?" if selection.get("date_from_inclusive", True)
+                       else "activity_timestamp > ?")
+        values.append(selection["date_from"])
+    if selection.get("date_to"):
+        clauses.append("activity_timestamp <= ?" if selection.get("date_to_inclusive", True)
+                       else "activity_timestamp < ?")
+        values.append(selection["date_to"])
+    extra = " AND " + " AND ".join(clauses) if clauses else ""
     return connection.execute(
         f"""SELECT * FROM activity_links
         WHERE status IN ({status_placeholders})
           AND mapping_decision IN ({mapping_placeholders})
+          {extra}
         ORDER BY source_activity_id, source_contact_id""",
-        (*sorted(IMPORTABLE_STATUSES), *sorted(IMPORTABLE_MAPPING_DECISIONS)),
+        (*sorted(IMPORTABLE_STATUSES), *sorted(IMPORTABLE_MAPPING_DECISIONS), *values),
     )
 
 
@@ -404,24 +466,71 @@ def write_report(ledger_path: Path, output: Path, report_kind: str) -> None:
 
 
 def generate_batch(
-    source_path: Path, ledger_path: Path, csv_path: Path, manifest_path: Path,
-    batch_id: str | None = None,
+    source_path: Path, ledger_path: Path, batch_directory: Path,
+    batch_id: str | None = None, *, environment: str = "sandbox",
+    target_portal_label: str = "unspecified", selection: dict | None = None,
+    operator_notes: str | None = None,
 ) -> dict[str, int]:
     """Create a reviewed candidate CSV and its non-imported row audit manifest.
 
     This is generation only: it performs no HubSpot write. Existing outputs are
     refused so a reviewed batch cannot be silently rewritten.
     """
-    if csv_path.exists() or manifest_path.exists():
-        raise FileExistsError("batch CSV and manifest outputs must be new files")
+    selection = selection or {}
+    batch_id = batch_id or str(uuid.uuid4())
+    if batch_directory.exists():
+        raise FileExistsError("batch directory already exists; create a new batch")
     source = open_read_only(source_path)
     ledger = open_ledger(ledger_path)
-    batch_id = batch_id or str(uuid.uuid4())
     try:
         validate_database(source)
-        links = list(importable_links(ledger))
+        if ledger.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone():
+            raise ValueError("batch_id has already been used; choose a new batch ID")
+        links = list(importable_links(ledger, selection))
+        selected_emails = {normalize_email(item) for item in selection.get("emails", [])}
+        selected_emails.discard(None)
+        if selection.get("emails") and len(selected_emails) != len(selection["emails"]):
+            raise ValueError("every selected email must be valid")
+        if selected_emails:
+            filtered = []
+            for link in links:
+                email = source.execute(
+                    """SELECT email FROM JobAdderContacts WHERE JobAdderOrganisationId=?
+                       AND contactId=?""",
+                    (link["organisation_id"], link["source_contact_id"]),
+                ).fetchone()
+                if email and normalize_email(email["email"]) in selected_emails:
+                    filtered.append(link)
+            links = filtered
         if shared_email_exceptions(ledger):
             raise ValueError("unresolved shared-email exceptions require a policy decision")
+        exact_selection = {
+            "contact_ids": selection.get("contact_ids", []),
+            # Never persist or print contact addresses; hashes unambiguously
+            # identify the exact normalized email selectors used for the run.
+            "email_sha256": sorted(email_reference(item) for item in selected_emails),
+            "classifications": selection.get("classifications", []),
+            "source_types": selection.get("source_types", []),
+            "date_from": selection.get("date_from"),
+            "date_from_inclusive": selection.get("date_from_inclusive", True),
+            "date_to": selection.get("date_to"),
+            "date_to_inclusive": selection.get("date_to_inclusive", True),
+        }
+        selected_counts = {
+            "row_count": len(links),
+            "unique_source_activities": len({
+                (row["organisation_id"], row["source_activity_id"]) for row in links
+            }),
+        }
+        # This output deliberately precedes mkdir/open: operators see precisely
+        # what will be emitted before any generated artifact exists.
+        print(json.dumps({"selection": exact_selection, "counts": selected_counts},
+                         sort_keys=True))
+        if not links:
+            raise ValueError("selection produced no importable rows; no batch was created")
+        batch_directory.mkdir(parents=False)
+        csv_path = batch_directory / "activities.csv"
+        manifest_path = batch_directory / "manifest.json"
         audit_rows = []
         mapping_hashes = set()
         with csv_path.open("x", encoding="utf-8-sig", newline="") as handle:
@@ -472,25 +581,46 @@ def generate_batch(
                     ).encode("utf-8")).hexdigest(),
                 })
         csv_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-        counts = migration_counts(ledger)
+        mapping_hash = next(iter(mapping_hashes), "")
+        if len(mapping_hashes) > 1:
+            raise ValueError("selection spans multiple mapping hashes; rediscover first")
+        source_hash = file_fingerprint(source_path)
         manifest = {
             "manifest_type": "non_imported_audit_manifest",
             "batch_id": batch_id,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "csv_file": csv_path.name,
             "csv_sha256": csv_hash,
-            "mapping_fingerprints": sorted(mapping_hashes),
-            "counts": counts,
+            "environment": environment,
+            "target_portal_label": target_portal_label,
+            "selection_filters": exact_selection,
+            "mapping_hash": mapping_hash,
+            "source_data_fingerprint": source_hash,
+            "generated_file_hash": csv_hash,
+            "row_count": len(audit_rows),
+            "reviewer": None,
+            "review_status": "pending",
+            "hubspot_import_name_or_id": None,
+            "import_started_at_utc": None,
+            "import_completed_at_utc": None,
+            "result_counts": None,
+            "operator_notes": operator_notes,
+            "counts": selected_counts,
             "rows": audit_rows,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         with ledger:
             ledger.execute(
                 """INSERT INTO batches
-                   (batch_id, csv_file, csv_sha256, manifest_file, status, created_at_utc)
-                   VALUES (?, ?, ?, ?, 'planned', ?)""",
+                   (batch_id, csv_file, csv_sha256, manifest_file, status, created_at_utc,
+                    environment, target_portal_label, selection_filters_json,
+                    mapping_hash, source_data_fingerprint, row_count, review_status,
+                    operator_notes)
+                   VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (batch_id, csv_path.name, csv_hash, manifest_path.name,
-                 manifest["generated_at_utc"]),
+                 manifest["generated_at_utc"], environment, target_portal_label,
+                 json.dumps(exact_selection, sort_keys=True), mapping_hash, source_hash,
+                 len(audit_rows), operator_notes),
             )
             for item in audit_rows:
                 key = item["source_key"]
@@ -503,11 +633,16 @@ def generate_batch(
                      key["source_activity_id"], key["source_contact_id"],
                      item["row_sha256"]),
                 )
-        return counts
+        # Generation is append-only: review never needs to edit either artifact.
+        csv_path.chmod(0o444)
+        manifest_path.chmod(0o444)
+        return selected_counts
     except Exception:
         # A failed generation is not a reviewable immutable batch.
-        csv_path.unlink(missing_ok=True)
-        manifest_path.unlink(missing_ok=True)
+        if batch_directory.exists():
+            for generated in batch_directory.iterdir():
+                generated.unlink()
+            batch_directory.rmdir()
         raise
     finally:
         source.close()
@@ -515,7 +650,10 @@ def generate_batch(
 
 
 def record_batch_state(ledger_path: Path, batch_id: str, state: str,
-                       import_id: str | None = None) -> None:
+                       import_id: str | None = None, *, reviewer: str | None = None,
+                       import_name: str | None = None,
+                       result_counts: dict | None = None,
+                       operator_notes: str | None = None) -> None:
     """Record review/submission/import outcomes; this performs no HubSpot write."""
     allowed = {
         "planned": {"reviewed", "rejected"},
@@ -533,10 +671,28 @@ def record_batch_state(ledger_path: Path, batch_id: str, state: str,
             raise ValueError(f"invalid batch transition {batch['status']} -> {state}")
         if state in {"submitted", "imported"} and not (import_id or "").strip():
             raise ValueError("submitted/imported states require an import_id")
+        if state == "reviewed" and not (reviewer or "").strip():
+            raise ValueError("reviewed state requires a reviewer")
+        now = datetime.now(timezone.utc).isoformat()
         with connection:
             connection.execute(
-                "UPDATE batches SET status=?, import_id=COALESCE(?, import_id) WHERE batch_id=?",
-                (state, (import_id or "").strip() or None, batch_id),
+                """UPDATE batches SET status=?, import_id=COALESCE(?, import_id),
+                   reviewer=COALESCE(?, reviewer),
+                   review_status=CASE WHEN ?='reviewed' THEN 'approved'
+                                      WHEN ?='rejected' THEN 'rejected' ELSE review_status END,
+                   hubspot_import_name=COALESCE(?, hubspot_import_name),
+                   import_started_at_utc=CASE WHEN ?='submitted' THEN ?
+                                              ELSE import_started_at_utc END,
+                   import_completed_at_utc=CASE WHEN ? IN ('imported','rejected') THEN ?
+                                                ELSE import_completed_at_utc END,
+                   result_counts_json=COALESCE(?, result_counts_json),
+                   operator_notes=COALESCE(?, operator_notes)
+                   WHERE batch_id=?""",
+                (state, (import_id or "").strip() or None,
+                 (reviewer or "").strip() or None, state, state,
+                 (import_name or "").strip() or None, state, now, state, now,
+                 json.dumps(result_counts, sort_keys=True) if result_counts is not None else None,
+                 operator_notes, batch_id),
             )
             row_state = state if state in {"submitted", "imported", "rejected"} else "planned"
             connection.execute(
@@ -566,14 +722,28 @@ def parse_args() -> argparse.Namespace:
     batch = commands.add_parser("generate-batch")
     batch.add_argument("database", type=Path)
     batch.add_argument("ledger", type=Path)
-    batch.add_argument("csv", type=Path)
-    batch.add_argument("manifest", type=Path)
+    batch.add_argument("batch_directory", type=Path)
     batch.add_argument("--batch-id")
+    batch.add_argument("--environment", required=True)
+    batch.add_argument("--target-portal-label", required=True)
+    batch.add_argument("--contact-id", action="append", default=[])
+    batch.add_argument("--email", action="append", default=[])
+    batch.add_argument("--classification", action="append", default=[])
+    batch.add_argument("--source-type", action="append", default=[])
+    batch.add_argument("--date-from")
+    batch.add_argument("--date-from-exclusive", action="store_true")
+    batch.add_argument("--date-to")
+    batch.add_argument("--date-to-exclusive", action="store_true")
+    batch.add_argument("--operator-notes")
     state = commands.add_parser("record-batch-state")
     state.add_argument("ledger", type=Path)
     state.add_argument("batch_id")
     state.add_argument("state", choices=("reviewed", "submitted", "imported", "rejected"))
     state.add_argument("--import-id")
+    state.add_argument("--import-name")
+    state.add_argument("--reviewer")
+    state.add_argument("--result-counts-json", type=json.loads)
+    state.add_argument("--operator-notes")
     return parser.parse_args()
 
 
@@ -586,10 +756,22 @@ def main() -> int:
     elif args.command == "decide-shared-emails":
         print(f"Updated links: {approve_shared_emails(args.ledger, args.decisions, args.confirm_reviewed_policy)}")
     elif args.command == "record-batch-state":
-        record_batch_state(args.ledger, args.batch_id, args.state, args.import_id)
+        record_batch_state(args.ledger, args.batch_id, args.state, args.import_id,
+                           reviewer=args.reviewer, import_name=args.import_name,
+                           result_counts=args.result_counts_json,
+                           operator_notes=args.operator_notes)
     else:
-        print(json.dumps(generate_batch(args.database, args.ledger, args.csv,
-                                        args.manifest, args.batch_id)))
+        selection = {
+            "contact_ids": args.contact_id, "emails": args.email,
+            "classifications": args.classification, "source_types": args.source_type,
+            "date_from": args.date_from,
+            "date_from_inclusive": not args.date_from_exclusive,
+            "date_to": args.date_to, "date_to_inclusive": not args.date_to_exclusive,
+        }
+        print(json.dumps(generate_batch(
+            args.database, args.ledger, args.batch_directory, args.batch_id,
+            environment=args.environment, target_portal_label=args.target_portal_label,
+            selection=selection, operator_notes=args.operator_notes)))
     return 0
 
 

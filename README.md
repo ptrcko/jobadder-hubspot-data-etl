@@ -100,12 +100,28 @@ quantities independently:
 - **expected HubSpot activity creations**, counting eligible pairs, because
   each pair produces its own HubSpot activity.
 
-Generate new files (the command refuses to overwrite either output):
+Generate a new batch directory (the command refuses an existing directory or a
+previously used batch ID). It prints the exact normalized selection and selected
+row/activity counts **before** creating the directory or CSV:
 
 ```bash
 python migration_ledger.py generate-batch jobadder-history.db migration-ledger.db \
-  reviewed-batch.csv reviewed-batch.audit.json --batch-id reviewed-2026-001
+  batches/reviewed-2026-001 --batch-id reviewed-2026-001 \
+  --environment sandbox --target-portal-label migration-test-portal \
+  --contact-id 123 --email reviewed@example.test --classification CALL \
+  --source-type User --date-from 2025-01-01T00:00:00Z \
+  --date-to 2025-01-31T23:59:59Z
 ```
+
+Contact IDs and emails may be repeated. Classification and source-type filters
+may also be repeated. Date boundaries are inclusive by default; use
+`--date-from-exclusive` and/or `--date-to-exclusive` when required. A changed
+selection or mapping always requires a new directory and batch ID. Each manifest
+and ledger batch record includes environment, target portal label, the complete
+selection (emails represented by normalized SHA-256 references, never addresses),
+mapping hash, source-data fingerprint, generated CSV hash, row count,
+review metadata, HubSpot import name/ID and dates, result counts, and operator
+notes. The CSV and manifest are made read-only after successful generation.
 
 The audit manifest is a review and reconciliation sidecar only. Never submit it
 to HubSpot or combine its composite source keys with visible activity content.
@@ -183,12 +199,35 @@ any import submission. Submission and reconciliation states require the portal's
 import ID:
 
 ```bash
-python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 reviewed
-python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 submitted --import-id 12345
-python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 imported --import-id 12345
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 reviewed --reviewer initials
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 submitted --import-id 12345 --import-name sandbox-acceptance-001
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 imported --import-id 12345 --result-counts-json '{"imported":10,"failed":0}' --operator-notes 'Reconciled in sandbox'
 ```
 
 A batch with an unknown or partial import outcome must be reconciled before any retry. Never regenerate and blindly replay it. Generated files are immutable: any correction creates a new batch with a new manifest and hashes.
+
+## Sandbox acceptance checklist
+
+Before approving any production batch, create a small, synthetic/sanitized batch
+for the named sandbox portal and retain aggregate evidence that all items pass:
+
+- [ ] **Contact association:** every activity is attached to the intended existing
+  contact and no contact was created, updated, merged, or deleted.
+- [ ] **Shared activities:** the approved one-activity-per-associated-contact policy
+  produces the expected separate activities and no unintended association.
+- [ ] **Direction:** inbound and outbound email/call direction is displayed correctly.
+- [ ] **Timestamps:** UTC conversion, dates, times, and ordering match the source,
+  including boundary selections.
+- [ ] **Visible content:** bodies are preserved without migration labels, IDs, or
+  other injected text.
+- [ ] **Unicode:** non-ASCII text and CSV UTF-8 encoding survive unchanged.
+- [ ] **Long bodies:** approved maximum-length samples import without silent
+  truncation; any portal limit is documented.
+- [ ] **Import errors:** rejected rows and partial/unknown outcomes are recorded and
+  reconciled before considering a replacement batch.
+- [ ] **Local replay prevention:** attempting to reuse the batch ID or directory is
+  refused, and a repeat-run/no-duplicate check confirms submitted source keys are
+  not selected into another batch.
 
 ## Documentation authority
 
