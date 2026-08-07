@@ -8,7 +8,9 @@ from pathlib import Path
 from migration_ledger import (
     NO_EMAIL_REASON,
     discover,
+    generate_batch,
     importable_links,
+    migration_counts,
     open_ledger,
     reconsider,
     write_report,
@@ -115,6 +117,51 @@ class MigrationLedgerTests(unittest.TestCase):
             "unmatched_contacts_without_source_email"
         ]
         self.assertEqual(summary[0]["status"], "approved_contact_match")
+
+    def test_shared_activity_creates_one_pair_and_csv_row_per_contact(self):
+        source = sqlite3.connect(self.source)
+        source.execute(
+            "INSERT INTO JobAdderContacts VALUES (12, 'second@example.test', 1)"
+        )
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1001, 12, 1)")
+        source.commit()
+        source.close()
+
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        ledger = open_ledger(self.ledger)
+        ledger.execute(
+            """UPDATE activity_links SET status = 'approved_contact_match',
+               hubspot_contact_id = 'approved-synthetic-id'
+               WHERE source_activity_id = '101'"""
+        )
+        ledger.commit()
+        self.assertEqual(migration_counts(ledger), {
+            "unique_source_activities": 2,
+            "activity_contact_pairs": 3,
+            "expected_hubspot_activity_creations": 2,
+        })
+        ledger.close()
+
+        batch = Path(self.temp.name) / "batch.csv"
+        manifest_path = Path(self.temp.name) / "batch.audit.json"
+        generate_batch(self.source, self.ledger, batch, manifest_path)
+        with batch.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["Contact email"] for row in rows},
+            {"synthetic@example.test", "second@example.test"},
+        )
+        self.assertTrue(all(len(row) == 4 for row in rows))
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["manifest_type"], "non_imported_audit_manifest")
+        self.assertEqual([row["csv_row_number"] for row in manifest["rows"]], [2, 3])
+        self.assertEqual(
+            {tuple(item["source_key"].values()) for item in manifest["rows"]},
+            {(1, "101", "11"), (1, "101", "12")},
+        )
+        with self.assertRaises(FileExistsError):
+            generate_batch(self.source, self.ledger, batch, manifest_path)
 
 
 if __name__ == "__main__":

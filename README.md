@@ -20,6 +20,13 @@ CSV files are the primary bulk-creation mechanism. HubSpot APIs are used for con
 
 A separate local migration ledger must track every source activity, contact match, deduplication result, batch membership, import result, retry, exclusion, and manual decision. After matching, **Contact Record ID** is the preferred CSV association identifier. Email is only a fallback discovery key and must not become the default import association when a Record ID is known.
 
+The migration work item is an activity/contact association identified by the
+composite key **`organisation_id + source_activity_id + source_contact_id`**.
+Discovery creates one ledger item for every valid association; it must not
+collapse associations merely because they share a JobAdder note ID. A shared
+JobAdder activity intentionally becomes a separate HubSpot activity for each
+associated contact, so every contact receives the historical context.
+
 ## Repository inventory
 
 - `hubspot_history_audit.py` is the read-only Phase 1 audit and classification utility.
@@ -68,6 +75,28 @@ Required activity fields are:
 - meetings: meeting description, meeting start time, and meeting end time.
 
 Always provide the activity timestamp, even where HubSpot describes it as recommended rather than required, so imported history retains its original chronology.
+
+Batch generation emits one CSV row for each eligible activity/contact pair and
+each row contains exactly one contact email. Source identifiers are not placed
+in the imported CSV. Instead, the separate, non-imported audit manifest maps
+the physical CSV row number (including the header as row 1) to the composite
+source key. Preview, manifest, and reconciliation counts report these three
+quantities independently:
+
+- **unique source activities**, counting a shared activity once;
+- **activity/contact pairs**, counting every discovered association; and
+- **expected HubSpot activity creations**, counting eligible pairs, because
+  each pair produces its own HubSpot activity.
+
+Generate new files (the command refuses to overwrite either output):
+
+```bash
+python migration_ledger.py generate-batch jobadder-history.db migration-ledger.db \
+  reviewed-batch.csv reviewed-batch.audit.json
+```
+
+The audit manifest is a review and reconciliation sidecar only. Never submit it
+to HubSpot or combine its composite source keys with visible activity content.
 
 ## Content policy
 
