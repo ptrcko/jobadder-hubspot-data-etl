@@ -23,6 +23,9 @@ A separate local migration ledger must track every source activity, contact matc
 ## Repository inventory
 
 - `hubspot_history_audit.py` is the read-only Phase 1 audit and classification utility.
+- `migration_ledger.py` is the restartable discovery-ledger foundation. It
+  retains activity links for source contacts without email, keeps them outside
+  import candidates, and produces aggregate preview/reconciliation reporting.
 - `hubspot_contact_export.py` is the older legacy, single-contact exporter prototype.
 - `hubspot_contact_export_2.py` is the newer single-contact exporter prototype; it is still not production batch tooling.
 - `activity-mapping.csv` contains the editable activity classification rules.
@@ -83,6 +86,49 @@ The `labelled_body()` behavior in `hubspot_contact_export_2.py` adds prototype l
 7. **Review** the batch, manifest, unresolved items, and portal import settings.
 8. **Import once** and record the import identifiers and outcome in the ledger.
 9. **Reconcile** HubSpot results against the manifest and ledger.
+
+## Contacts without source email
+
+Future ledger discovery must not filter source links on `JobAdderContacts.email`.
+Run the restartable discovery command instead; it opens JobAdder with SQLite
+`mode=ro` and `query_only`, and writes state only to a separate ledger:
+
+```bash
+python migration_ledger.py discover jobadder-history.db migration-ledger.db \
+  --mapping activity-mapping.csv --cutoff 2026-06-23T00:00:00Z
+```
+
+A link whose JobAdder contact has no email is retained as
+`unmatched_contact`, with reason
+`source_contact_has_no_email_and_is_not_in_hubspot`. The ledger preserves the
+source contact/activity IDs, type, timestamp, mapping decision/reason and
+mapping fingerprint, but its schema deliberately has no contact-address field.
+The import-candidate boundary only returns links with an approved contact match,
+a pre-existing HubSpot Contact Record ID, and an importable mapping decision;
+therefore unresolved links cannot enter a generated HubSpot CSV.
+
+Both batch previews and final reconciliation reports include privacy-safe counts
+by activity type and current status, with the earliest and latest source
+timestamps. Reconsidered links remain in these totals, so the final report does
+not erase the fact that they originally lacked source email:
+
+```bash
+python migration_ledger.py preview migration-ledger.db batch-preview.json
+python migration_ledger.py reconcile migration-ledger.db final-reconciliation.json
+```
+
+If a separate, operator-owned process later creates those contacts in HubSpot,
+an operator may prepare a reviewed CSV containing only
+`source_contact_id,hubspot_contact_id` and explicitly reconsider the links:
+
+```bash
+python migration_ledger.py reconsider-unmatched migration-ledger.db approved-matches.csv \
+  --confirm-contacts-already-exist-in-hubspot
+```
+
+The confirmation is mandatory and the match file must contain nonblank IDs.
+This command only records approved associations and state transitions. It has no
+HubSpot API write path and never creates, updates, merges, or deletes contacts.
 
 A batch with an unknown or partial import outcome must be reconciled before any retry. Never regenerate and blindly replay it. Generated files are immutable: any correction creates a new batch with a new manifest and hashes.
 
