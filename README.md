@@ -29,8 +29,8 @@ cannot enter a batch.
 HubSpot's contact-email uniqueness is only an association mechanism. It says
 nothing about whether an activity was previously imported. Replay protection
 comes from the local ledger's composite source key, immutable batch ID, CSV and
-row hashes, row-level manifest, and ordered `planned` / `reviewed` / `submitted`
-/ `imported` states. Never replay a CSV based on email uniqueness.
+row hashes, row-level manifest, and evidence-based state transitions. Never
+replay a CSV based on email uniqueness.
 
 The migration work item is an activity/contact association identified by the
 composite key **`organisation_id + source_activity_id + source_contact_id`**.
@@ -194,14 +194,38 @@ python migration_ledger.py decide-shared-emails migration-ledger.db shared-polic
 This command only records the policy outcome. It has no HubSpot API write path
 and never creates, updates, merges, or deletes contacts.
 
-After reviewing a generated manifest, record state transitions separately from
-any import submission. Submission and reconciliation states require the portal's
-import ID:
+After reviewing a generated manifest, record submission separately. Manual UI
+imports may have either an import name or identifier, but always require the
+operator; the ledger retains that value, submission time, batch ID, immutable
+file hash, and every physical CSV row number:
 
 ```bash
 python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 reviewed --reviewer initials
-python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 submitted --import-id 12345 --import-name sandbox-acceptance-001
-python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 imported --import-id 12345 --result-counts-json '{"imported":10,"failed":0}' --operator-notes 'Reconciled in sandbox'
+python migration_ledger.py record-batch-state migration-ledger.db reviewed-2026-001 submitted --import-id 12345 --import-name sandbox-acceptance-001 --operator initials
+```
+
+Download every HubSpot error CSV and reconcile it with the reported successful
+and failed totals. The command copies each error file into a local immutable
+evidence directory and records its hash; these files and the ledger are
+sensitive local artifacts and must not be committed:
+
+```bash
+python migration_ledger.py reconcile-manual-import migration-ledger.db reviewed-2026-001 local-import-evidence/reviewed-2026-001 --successful 9 --failed 1 --checked-by initials --error-file hubspot-errors.csv
+```
+
+Rows present in the error files become `rejected`. Rows absent from those files
+become `confirmed_by_import` only when successful + failed equals the manifest
+row count, the unique error row count equals the reported failed total, and
+every error row number belongs to the batch. Any discrepancy marks the whole
+batch and its rows `reconciliation_required`; it must not be retried.
+`hubspot_activity_id` is nullable and is neither fabricated nor required.
+
+Optional `confirmed_by_export_sample` and `confirmed_manually` checks are stored
+as independent evidence. They record the checker and time, a sanitized contact
+reference (never an address), date/type range, and sanitized observations:
+
+```bash
+python migration_ledger.py record-stronger-confirmation migration-ledger.db reviewed-2026-001 confirmed_by_export_sample --checked-by initials --selection-json '{"contact_reference":"sha256:synthetic","date_from":"2025-01-01","date_to":"2025-01-31","activity_types":["CALL"]}' --observation 'Synthetic sample matched the reviewed timestamp and type'
 ```
 
 A batch with an unknown or partial import outcome must be reconciled before any retry. Never regenerate and blindly replay it. Generated files are immutable: any correction creates a new batch with a new manifest and hashes.
