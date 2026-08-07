@@ -138,9 +138,10 @@ class MigrationLedgerTests(unittest.TestCase):
         })
         ledger.close()
 
-        batch = Path(self.temp.name) / "batch.csv"
-        manifest_path = Path(self.temp.name) / "batch.audit.json"
-        generate_batch(self.source, self.ledger, batch, manifest_path)
+        batch_dir = Path(self.temp.name) / "batch"
+        generate_batch(self.source, self.ledger, batch_dir)
+        batch = batch_dir / "activities.csv"
+        manifest_path = batch_dir / "manifest.json"
         with batch.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 2)
@@ -160,7 +161,7 @@ class MigrationLedgerTests(unittest.TestCase):
             {(1, "101", "11"), (1, "101", "12")},
         )
         with self.assertRaises(FileExistsError):
-            generate_batch(self.source, self.ledger, batch, manifest_path)
+            generate_batch(self.source, self.ledger, batch_dir)
 
     def test_shared_normalized_email_requires_explicit_policy(self):
         source = sqlite3.connect(self.source)
@@ -183,10 +184,9 @@ class MigrationLedgerTests(unittest.TestCase):
         exception = json.loads(report.read_text())["shared_email_exceptions"][0]
         self.assertEqual(exception["source_contact_ids"], "11,12")
         self.assertEqual(exception["email_sha256"], email_reference("synthetic@example.test"))
-        batch = Path(self.temp.name) / "blocked.csv"
-        manifest = Path(self.temp.name) / "blocked.json"
+        batch = Path(self.temp.name) / "blocked"
         with self.assertRaises(ValueError):
-            generate_batch(self.source, self.ledger, batch, manifest)
+            generate_batch(self.source, self.ledger, batch)
         decisions = Path(self.temp.name) / "policy.csv"
         decisions.write_text(
             f"email_sha256,decision\n{exception['email_sha256']},approve_import\n"
@@ -194,8 +194,8 @@ class MigrationLedgerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             approve_shared_emails(self.ledger, decisions, False)
         self.assertEqual(approve_shared_emails(self.ledger, decisions, True), 2)
-        generate_batch(self.source, self.ledger, batch, manifest, "synthetic-batch")
-        with batch.open(encoding="utf-8-sig", newline="") as handle:
+        generate_batch(self.source, self.ledger, batch, "synthetic-batch")
+        with (batch / "activities.csv").open(encoding="utf-8-sig", newline="") as handle:
             self.assertEqual(
                 {row["Contact email"] for row in csv.DictReader(handle)},
                 {"synthetic@example.test"},
@@ -203,12 +203,11 @@ class MigrationLedgerTests(unittest.TestCase):
 
     def test_batch_state_requires_order_and_import_id(self):
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
-        batch = Path(self.temp.name) / "batch.csv"
-        manifest = Path(self.temp.name) / "manifest.json"
-        generate_batch(self.source, self.ledger, batch, manifest, "batch-1")
+        batch = Path(self.temp.name) / "batch"
+        generate_batch(self.source, self.ledger, batch, "batch-1")
         with self.assertRaises(ValueError):
             record_batch_state(self.ledger, "batch-1", "submitted", "import-1")
-        record_batch_state(self.ledger, "batch-1", "reviewed")
+        record_batch_state(self.ledger, "batch-1", "reviewed", reviewer="Synthetic Reviewer")
         with self.assertRaises(ValueError):
             record_batch_state(self.ledger, "batch-1", "submitted")
         record_batch_state(self.ledger, "batch-1", "submitted", "import-1")
@@ -221,6 +220,34 @@ class MigrationLedgerTests(unittest.TestCase):
             "SELECT state FROM batch_rows WHERE batch_id='batch-1'"
         )}, {"imported"})
         ledger.close()
+
+    def test_selection_and_manifest_metadata_are_auditable(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        directory = Path(self.temp.name) / "selected-batch"
+        counts = generate_batch(
+            self.source, self.ledger, directory, "selection-1",
+            environment="test", target_portal_label="synthetic-sandbox",
+            selection={
+                "contact_ids": ["11"], "emails": ["SYNTHETIC@example.test"],
+                "classifications": ["CALL"], "source_types": ["User"],
+                "date_from": "1970-01-01T00:00:02Z", "date_from_inclusive": True,
+                "date_to": "1970-01-01T00:00:02Z", "date_to_inclusive": True,
+            }, operator_notes="synthetic fixture",
+        )
+        self.assertEqual(counts, {"row_count": 1, "unique_source_activities": 1})
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["environment"], "test")
+        self.assertEqual(manifest["target_portal_label"], "synthetic-sandbox")
+        self.assertEqual(manifest["row_count"], 1)
+        self.assertEqual(len(manifest["mapping_hash"]), 64)
+        self.assertEqual(len(manifest["source_data_fingerprint"]), 64)
+        self.assertEqual(manifest["generated_file_hash"], manifest["csv_sha256"])
+        self.assertEqual(manifest["selection_filters"]["email_sha256"],
+                         [email_reference("synthetic@example.test")])
+        self.assertEqual((directory / "activities.csv").stat().st_mode & 0o222, 0)
+        with self.assertRaises(ValueError):
+            generate_batch(self.source, self.ledger,
+                           Path(self.temp.name) / "different-dir", "selection-1")
 
 
 if __name__ == "__main__":
