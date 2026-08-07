@@ -31,6 +31,7 @@ from hubspot_history_audit import (
 NO_EMAIL_REASON = "source_contact_has_no_email_and_is_not_in_hubspot"
 IMPORTABLE_STATUSES = {"approved_contact_match"}
 IMPORTABLE_MAPPING_DECISIONS = {"CALL", "OUTBOUND_EMAIL", "INBOUND_EMAIL", "NOTE"}
+CSV_FIELDS = ["Contact email", "Activity type", "Activity timestamp", "Activity body"]
 
 
 def mapping_fingerprint(path: Path) -> str:
@@ -59,7 +60,7 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             hubspot_contact_id TEXT,
             discovered_at_utc TEXT NOT NULL,
             reconsidered_at_utc TEXT,
-            PRIMARY KEY (organisation_id, source_contact_id, source_activity_id)
+            PRIMARY KEY (organisation_id, source_activity_id, source_contact_id)
         );
         CREATE TABLE IF NOT EXISTS state_transitions (
             id INTEGER PRIMARY KEY,
@@ -178,6 +179,26 @@ def unmatched_summary(connection: sqlite3.Connection) -> list[dict[str, object]]
     )]
 
 
+def migration_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    """Return activity and association counts without conflating the two."""
+    row = connection.execute(
+        """
+        SELECT (SELECT COUNT(*) FROM (
+                   SELECT organisation_id, source_activity_id
+                   FROM activity_links GROUP BY organisation_id, source_activity_id
+               )) AS unique_source_activities,
+               COUNT(*) AS activity_contact_pairs,
+               SUM(CASE WHEN status IN ('approved_contact_match')
+                         AND mapping_decision IN ('CALL', 'OUTBOUND_EMAIL',
+                                                  'INBOUND_EMAIL', 'NOTE')
+                         AND hubspot_contact_id IS NOT NULL
+                        THEN 1 ELSE 0 END) AS expected_hubspot_activity_creations
+        FROM activity_links
+        """
+    ).fetchone()
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
 def importable_links(connection: sqlite3.Connection):
     """Yield only links explicitly approved for a pre-existing HubSpot contact.
 
@@ -202,11 +223,87 @@ def write_report(ledger_path: Path, output: Path, report_kind: str) -> None:
         payload = {
             "report": report_kind,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "counts": migration_counts(connection),
             "unmatched_contacts_without_source_email": unmatched_summary(connection),
         }
         output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     finally:
         connection.close()
+
+
+def generate_batch(
+    source_path: Path, ledger_path: Path, csv_path: Path, manifest_path: Path
+) -> dict[str, int]:
+    """Create a reviewed candidate CSV and its non-imported row audit manifest.
+
+    This is generation only: it performs no HubSpot write. Existing outputs are
+    refused so a reviewed batch cannot be silently rewritten.
+    """
+    if csv_path.exists() or manifest_path.exists():
+        raise FileExistsError("batch CSV and manifest outputs must be new files")
+    source = open_read_only(source_path)
+    ledger = open_ledger(ledger_path)
+    try:
+        validate_database(source)
+        links = list(importable_links(ledger))
+        audit_rows = []
+        mapping_hashes = set()
+        with csv_path.open("x", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            for csv_row_number, link in enumerate(links, start=2):
+                source_row = source.execute(
+                    """SELECT c.email, n.text
+                    FROM JobAdderNotes n
+                    JOIN JobAdderNoteContacts nc
+                      ON nc.JobAdderOrganisationId = n.JobAdderOrganisationId
+                     AND nc.noteId = n.noteId
+                    JOIN JobAdderContacts c
+                      ON c.JobAdderOrganisationId = nc.JobAdderOrganisationId
+                     AND c.contactId = nc.contactId
+                    WHERE n.JobAdderOrganisationId = ? AND n.Id = ?
+                      AND nc.contactId = ?""",
+                    (link["organisation_id"], link["source_activity_id"],
+                     link["source_contact_id"]),
+                ).fetchone()
+                if source_row is None or not (source_row["email"] or "").strip():
+                    raise ValueError("eligible pair has no source contact email")
+                writer.writerow({
+                    "Contact email": source_row["email"].strip(),
+                    "Activity type": link["mapping_decision"],
+                    "Activity timestamp": link["activity_timestamp"],
+                    "Activity body": source_row["text"] or "",
+                })
+                mapping_hashes.add(link["mapping_fingerprint"])
+                audit_rows.append({
+                    "csv_row_number": csv_row_number,
+                    "source_key": {
+                        "organisation_id": link["organisation_id"],
+                        "source_activity_id": link["source_activity_id"],
+                        "source_contact_id": link["source_contact_id"],
+                    },
+                })
+        csv_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+        counts = migration_counts(ledger)
+        manifest = {
+            "manifest_type": "non_imported_audit_manifest",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "csv_file": csv_path.name,
+            "csv_sha256": csv_hash,
+            "mapping_fingerprints": sorted(mapping_hashes),
+            "counts": counts,
+            "rows": audit_rows,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return counts
+    except Exception:
+        # A failed generation is not a reviewable immutable batch.
+        csv_path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close()
+        ledger.close()
 
 
 def reconsider(ledger_path: Path, matches_path: Path, confirmed: bool) -> int:
@@ -276,6 +373,11 @@ def parse_args() -> argparse.Namespace:
     retry.add_argument("ledger", type=Path)
     retry.add_argument("approved_matches", type=Path)
     retry.add_argument("--confirm-contacts-already-exist-in-hubspot", action="store_true")
+    batch = commands.add_parser("generate-batch")
+    batch.add_argument("database", type=Path)
+    batch.add_argument("ledger", type=Path)
+    batch.add_argument("csv", type=Path)
+    batch.add_argument("manifest", type=Path)
     return parser.parse_args()
 
 
@@ -285,8 +387,10 @@ def main() -> int:
         print(json.dumps(discover(args.database, args.ledger, args.mapping, args.cutoff, args.organisation_id)))
     elif args.command in {"preview", "reconcile"}:
         write_report(args.ledger, args.output, args.command)
-    else:
+    elif args.command == "reconsider-unmatched":
         print(f"Reconsidered links: {reconsider(args.ledger, args.approved_matches, args.confirm_contacts_already_exist_in_hubspot)}")
+    else:
+        print(json.dumps(generate_batch(args.database, args.ledger, args.csv, args.manifest)))
     return 0
 
 
