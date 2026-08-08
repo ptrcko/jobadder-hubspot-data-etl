@@ -49,6 +49,9 @@ associated contact, so every contact receives the historical context.
 - `hubspot_contact_export_2.py` is the newer single-contact exporter prototype; it is still not production batch tooling.
 - `activity-mapping.csv` contains the editable activity classification rules.
 - [`PHASE-1-README.md`](PHASE-1-README.md) documents the existing audit command and its reports.
+- [`SOURCE_SCHEMA_AND_LOGGING.md`](SOURCE_SCHEMA_AND_LOGGING.md) records the observed
+  source working-copy schema, timestamp validation contract, and structured
+  migration logging requirements.
 - `HubspotDocs/` contains copied HubSpot documentation snapshots, not live documentation.
 - `audit-summary.json`, `activity-types.csv`, `classification-summary.csv`, and `data-quality.csv` are checked-in aggregate audit artifacts. They contain no row-level content, but may be stale. Do not rely on an audit artifact unless its recorded mapping fingerprint matches the current `activity-mapping.csv`; artifacts without a fingerprint must be treated as unverifiable and regenerated.
 
