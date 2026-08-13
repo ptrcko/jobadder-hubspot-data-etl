@@ -536,6 +536,56 @@ class MigrationLedgerTests(unittest.TestCase):
             generate_batch(self.source, self.ledger, Path(self.temp.name) / "not-notes",
                            environment="sandbox", sandbox_collapse_by_email=True)
 
+    def test_controlled_supersession_preserves_history_and_blocks_current_version(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        first = Path(self.temp.name) / "policy-v1"
+        generate_batch(self.source, self.ledger, first, "policy-v1")
+        db = open_ledger(self.ledger)
+        with db:
+            db.execute("UPDATE batches SET body_transformation_version='note-body-v1' WHERE batch_id='policy-v1'")
+            db.execute("UPDATE batch_rows SET body_transformation_version='note-body-v1' WHERE batch_id='policy-v1'")
+        old_processing = db.execute("SELECT COUNT(*) FROM note_processing").fetchone()[0]
+        db.close()
+        second = Path(self.temp.name) / "policy-v2"
+        counts = generate_batch(self.source, self.ledger, second, "policy-v2",
+            regenerate=True, supersedes_batch_id="policy-v1",
+            regeneration_reason="synthetic approved transformation change")
+        self.assertEqual(counts["row_count"], 1)
+        db = open_ledger(self.ledger)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM batch_rows").fetchone()[0], 2)
+        row = db.execute("SELECT * FROM batch_rows WHERE batch_id='policy-v2'").fetchone()
+        self.assertEqual((row["supersedes_batch_id"], row["prior_csv_row_number"]),
+                         ("policy-v1", 2))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM note_processing").fetchone()[0],
+                         old_processing)
+        db.close()
+        third = Path(self.temp.name) / "policy-v2-repeat"
+        repeat = generate_batch(self.source, self.ledger, third, "policy-v2-repeat",
+            regenerate=True, supersedes_batch_id="policy-v1",
+            regeneration_reason="synthetic repeat")
+        self.assertEqual(repeat["row_count"], 0)
+        self.assertFalse(third.exists())
+
+    def test_supersession_refuses_unsafe_prior_import_states(self):
+        for state in ("submitted", "confirmed_by_import", "reconciliation_required", "reviewed"):
+            with self.subTest(state=state):
+                name = f"unsafe-{state}"
+                db = open_ledger(self.ledger)
+                with db:
+                    db.execute("""INSERT INTO batches
+                        (batch_id,csv_file,csv_sha256,manifest_file,status,created_at_utc,
+                         environment,target_portal_label,selection_filters_json,mapping_hash,
+                         source_data_fingerprint,row_count,body_transformation_version,import_id)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (name, "x", hashlib.sha256(name.encode()).hexdigest(), "m", state,
+                         "2026-01-01T00:00:00Z", "sandbox", "test", "{}", "x", "x", 0,
+                         "note-body-v1", "import-id" if state != "reviewed" else None))
+                db.close()
+                with self.assertRaisesRegex(ValueError, "prior import state is unsafe"):
+                    generate_batch(self.source, self.ledger, Path(self.temp.name) / name,
+                        regenerate=True, supersedes_batch_id=name,
+                        regeneration_reason="must be refused")
+
 
 if __name__ == "__main__":
     unittest.main()

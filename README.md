@@ -119,6 +119,25 @@ python migration_ledger.py generate-batch jobadder-history.db migration-ledger.d
   --date-to 2025-01-31T23:59:59Z
 ```
 
+Policy-driven regeneration is an explicit exception to normal replay prevention.
+Use `--regenerate` with exactly one of `--supersedes-batch-id` or
+`--supersedes-policy-version`, plus a nonblank `--regeneration-reason`. Only
+never-submitted `planned` batches may be superseded; submitted, confirmed,
+partially reconciled, and unknown-outcome imports are blocked pending a separate,
+documented reconciliation workflow. The command creates a new directory, CSV,
+manifest, batch, and versioned processing records with row-level lineage. It
+never edits or deletes the old batch. Rows already batched with the current body
+transformation version remain excluded. HubSpot CSV imports are **not idempotent**:
+supersession permission is not permission to retry an import.
+
+```bash
+python migration_ledger.py generate-batch jobadder-history.db migration-ledger.db \
+  batches/policy-v2 --batch-id policy-v2 --environment sandbox \
+  --target-portal-label migration-test-portal --regenerate \
+  --supersedes-batch-id policy-v1 \
+  --regeneration-reason "Approved body transformation v2"
+```
+
 Contact IDs and emails may be repeated. Classification and source-type filters
 may also be repeated. Date boundaries are inclusive by default; use
 `--date-from-exclusive` and/or `--date-to-exclusive` when required. A changed
