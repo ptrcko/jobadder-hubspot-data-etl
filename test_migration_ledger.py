@@ -314,6 +314,28 @@ class MigrationLedgerTests(unittest.TestCase):
             generate_batch(self.source, self.ledger,
                            Path(self.temp.name) / "different-dir", "selection-1")
 
+    def test_render_as_notes_preserves_mapping_but_outputs_notes(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        directory = Path(self.temp.name) / "all-as-notes"
+        counts = generate_batch(
+            self.source, self.ledger, directory, "all-as-notes-1",
+            environment="sandbox", target_portal_label="synthetic-sandbox",
+            render_as_notes=True,
+        )
+        self.assertEqual(counts, {"row_count": 1, "unique_source_activities": 1})
+        with (directory / "activities.csv").open(
+                encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[0]["Activity type"], "NOTE")
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["selection_filters"]["output_activity_type"], "NOTE")
+        ledger = open_ledger(self.ledger)
+        self.assertEqual(
+            ledger.execute("SELECT mapping_decision FROM activity_links").fetchone()[0],
+            "CALL",
+        )
+        ledger.close()
+
 
 if __name__ == "__main__":
     unittest.main()

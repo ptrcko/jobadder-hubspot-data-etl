@@ -129,6 +129,24 @@ notes. The CSV and manifest are made read-only after successful generation.
 The audit manifest is a review and reconciliation sidecar only. Never submit it
 to HubSpot or combine its composite source keys with visible activity content.
 
+### Render all eligible JobAdder history as HubSpot notes
+
+JobAdder stores the historical items used by this migration as notes, including
+items whose controlled classification records that their business meaning is a
+call or email. For a single HubSpot Notes import, use the explicit output mode
+without a classification filter:
+
+```powershell
+python .\migration_ledger.py generate-batch "..\jobadder-history" ".\ledger\migration-ledger.db" ".\batches\sandbox-all-notes-001" --batch-id "sandbox-all-notes-001" --environment "sandbox" --target-portal-label "YOUR-SANDBOX-PORTAL" --render-as-notes --operator-notes "All eligible JobAdder history rendered as HubSpot notes"
+```
+
+`--render-as-notes` writes `NOTE` in every CSV `Activity type` cell. It does not
+change the controlled mapping or make `EXCLUDE`/`REVIEW` rows eligible: the
+original mapping decision and fingerprint remain in the ledger, and the manifest
+records `output_activity_type` as `NOTE`. Unresolved shared-email exceptions
+still block generation until each email hash has an explicitly reviewed
+`approve_import` or `exclude` policy decision.
+
 ## Content policy
 
 Visible activity bodies must not add `JobAdder call`, `JobAdder email`, `JobAdder activity`, source IDs, migration references, or similar migration labels. This restriction applies to migration-added text: legitimate original content that mentions JobAdder must remain unchanged.
