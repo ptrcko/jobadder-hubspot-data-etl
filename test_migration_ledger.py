@@ -336,6 +336,76 @@ class MigrationLedgerTests(unittest.TestCase):
         )
         ledger.close()
 
+    def test_sandbox_collapse_groups_shared_email_but_not_distinct_recipients_or_activities(self):
+        source = sqlite3.connect(self.source)
+        source.executescript(
+            """
+            INSERT INTO JobAdderContacts VALUES
+              (12, ' SYNTHETIC@EXAMPLE.TEST ', 1),
+              (13, 'other@example.test', 1);
+            INSERT INTO JobAdderNotes VALUES
+              (102, 1002, 'Phone Call', 'User', 'synthetic', 3000, 1);
+            INSERT INTO JobAdderNoteContacts VALUES
+              (1001, 12, 1), (1001, 13, 1), (1002, 11, 1);
+            """
+        )
+        source.commit()
+        source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+
+        directory = Path(self.temp.name) / "collapsed"
+        counts = generate_batch(
+            self.source, self.ledger, directory, "collapsed-1",
+            environment="sandbox", target_portal_label="synthetic-sandbox",
+            render_as_notes=True, sandbox_collapse_by_email=True,
+        )
+        # Activity 101 has two source contacts for one normalized email and one
+        # distinct recipient; activity 102 remains distinct despite equal body.
+        self.assertEqual(counts, {"row_count": 3, "unique_source_activities": 2,
+                                  "source_link_count": 4, "collapsed_row_total": 1})
+        with (directory / "activities.csv").open(
+                encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["Contact email"] for row in rows].count(
+            "synthetic@example.test"), 2)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        collapsed = next(row for row in manifest["rows"]
+                         if len(row["source_keys"]) == 2)
+        self.assertEqual({key["source_contact_id"] for key in collapsed["source_keys"]},
+                         {"11", "12"})
+        self.assertEqual(manifest["sandbox_policy"]["name"],
+                         "collapse_by_normalized_email")
+        ledger = open_ledger(self.ledger)
+        batch = ledger.execute("SELECT * FROM batches WHERE batch_id='collapsed-1'").fetchone()
+        self.assertEqual((batch["source_link_count"], batch["collapsed_row_total"]), (4, 1))
+        self.assertEqual(ledger.execute(
+            "SELECT COUNT(*) FROM batch_row_sources WHERE batch_id='collapsed-1'"
+        ).fetchone()[0], 4)
+        ledger.close()
+
+    def test_sandbox_collapse_excludes_submitted_keys_and_rejects_unsafe_modes(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        first = Path(self.temp.name) / "first"
+        generate_batch(self.source, self.ledger, first, "first")
+        record_batch_state(self.ledger, "first", "reviewed", reviewer="Reviewer")
+        record_batch_state(self.ledger, "first", "submitted", "import-1",
+                           operator="Operator")
+        with self.assertRaisesRegex(ValueError, "no importable rows"):
+            generate_batch(
+                self.source, self.ledger, Path(self.temp.name) / "repeat", "repeat",
+                environment="sandbox", render_as_notes=True,
+                sandbox_collapse_by_email=True)
+        with self.assertRaisesRegex(ValueError, "environment sandbox"):
+            generate_batch(
+                self.source, self.ledger, Path(self.temp.name) / "production", "production",
+                environment="production", render_as_notes=True,
+                sandbox_collapse_by_email=True)
+        with self.assertRaisesRegex(ValueError, "render-as-notes"):
+            generate_batch(
+                self.source, self.ledger, Path(self.temp.name) / "not-notes", "not-notes",
+                environment="sandbox", sandbox_collapse_by_email=True)
+
 
 if __name__ == "__main__":
     unittest.main()

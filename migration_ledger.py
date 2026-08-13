@@ -158,6 +158,17 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             PRIMARY KEY (batch_id, csv_row_number),
             UNIQUE (organisation_id, source_activity_id, source_contact_id)
         );
+        CREATE TABLE IF NOT EXISTS batch_row_sources (
+            batch_id TEXT NOT NULL,
+            csv_row_number INTEGER NOT NULL,
+            organisation_id INTEGER NOT NULL,
+            source_activity_id TEXT NOT NULL,
+            source_contact_id TEXT NOT NULL,
+            PRIMARY KEY (batch_id, csv_row_number, organisation_id,
+                         source_activity_id, source_contact_id),
+            FOREIGN KEY (batch_id, csv_row_number)
+              REFERENCES batch_rows(batch_id, csv_row_number)
+        );
         CREATE TABLE IF NOT EXISTS import_reconciliations (
             id INTEGER PRIMARY KEY,
             batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -212,6 +223,9 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         "import_completed_at_utc": "TEXT", "result_counts_json": "TEXT",
         "operator_notes": "TEXT",
         "submitted_by": "TEXT",
+        "sandbox_policy_json": "TEXT",
+        "source_link_count": "INTEGER NOT NULL DEFAULT 0",
+        "collapsed_row_total": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in existing:
@@ -517,6 +531,7 @@ def generate_batch(
     batch_id: str | None = None, *, environment: str = "sandbox",
     target_portal_label: str = "unspecified", selection: dict | None = None,
     operator_notes: str | None = None, render_as_notes: bool = False,
+    sandbox_collapse_by_email: bool = False,
 ) -> dict[str, int]:
     """Create a reviewed candidate CSV and its non-imported row audit manifest.
 
@@ -524,6 +539,10 @@ def generate_batch(
     refused so a reviewed batch cannot be silently rewritten.
     """
     selection = selection or {}
+    if sandbox_collapse_by_email and environment != "sandbox":
+        raise ValueError("--sandbox-collapse-by-email requires --environment sandbox")
+    if sandbox_collapse_by_email and not render_as_notes:
+        raise ValueError("--sandbox-collapse-by-email requires --render-as-notes")
     batch_id = batch_id or str(uuid.uuid4())
     if batch_directory.exists():
         raise FileExistsError("batch directory already exists; create a new batch")
@@ -534,6 +553,34 @@ def generate_batch(
         if ledger.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone():
             raise ValueError("batch_id has already been used; choose a new batch ID")
         links = list(importable_links(ledger, selection))
+        if sandbox_collapse_by_email:
+            # This narrowly scoped sandbox policy replaces manual shared-email
+            # decisions, but does not make any other exception importable.
+            approved_keys = {(r["organisation_id"], r["source_activity_id"],
+                              r["source_contact_id"]) for r in links}
+            for row in ledger.execute(
+                    """SELECT * FROM activity_links
+                       WHERE status='shared_email_exception'
+                         AND mapping_decision IN ('CALL','OUTBOUND_EMAIL','INBOUND_EMAIL','NOTE')
+                       ORDER BY source_activity_id, source_contact_id"""):
+                if (row["organisation_id"], row["source_activity_id"],
+                        row["source_contact_id"]) not in approved_keys:
+                    links.append(row)
+            links = [row for row in links
+                     if (not selection.get("contact_ids") or row["source_contact_id"] in
+                         {str(value) for value in selection["contact_ids"]})
+                     and (not selection.get("classifications") or row["mapping_decision"] in
+                          selection["classifications"])
+                     and (not selection.get("source_types") or row["activity_source"] in
+                          selection["source_types"])
+                     and (not selection.get("date_from") or
+                          (row["activity_timestamp"] >= selection["date_from"] if
+                           selection.get("date_from_inclusive", True) else
+                           row["activity_timestamp"] > selection["date_from"]))
+                     and (not selection.get("date_to") or
+                          (row["activity_timestamp"] <= selection["date_to"] if
+                           selection.get("date_to_inclusive", True) else
+                           row["activity_timestamp"] < selection["date_to"]))]
         selected_emails = {normalize_email(item) for item in selection.get("emails", [])}
         selected_emails.discard(None)
         if selection.get("emails") and len(selected_emails) != len(selection["emails"]):
@@ -549,7 +596,7 @@ def generate_batch(
                 if email and normalize_email(email["email"]) in selected_emails:
                     filtered.append(link)
             links = filtered
-        if shared_email_exceptions(ledger):
+        if shared_email_exceptions(ledger) and not sandbox_collapse_by_email:
             raise ValueError("unresolved shared-email exceptions require a policy decision")
         exact_selection = {
             "contact_ids": selection.get("contact_ids", []),
@@ -563,18 +610,63 @@ def generate_batch(
             "date_to": selection.get("date_to"),
             "date_to_inclusive": selection.get("date_to_inclusive", True),
             "output_activity_type": "NOTE" if render_as_notes else "source_mapping",
+            "sandbox_collapse_by_email": sandbox_collapse_by_email,
         }
+        prepared = []
+        for link in links:
+            source_row = source.execute(
+                """SELECT c.email, n.text FROM JobAdderNotes n
+                   JOIN JobAdderNoteContacts nc ON nc.JobAdderOrganisationId=n.JobAdderOrganisationId
+                    AND nc.noteId=n.noteId
+                   JOIN JobAdderContacts c ON c.JobAdderOrganisationId=nc.JobAdderOrganisationId
+                    AND c.contactId=nc.contactId
+                   WHERE n.JobAdderOrganisationId=? AND n.Id=? AND nc.contactId=?""",
+                (link["organisation_id"], link["source_activity_id"],
+                 link["source_contact_id"])).fetchone()
+            normalized = normalize_email(source_row["email"] if source_row else None)
+            if normalized is None or (sandbox_collapse_by_email and not (source_row["text"] or "").strip()):
+                continue
+            planned_hash = ledger.execute(
+                """SELECT email_sha256 FROM contact_email_plans
+                   WHERE organisation_id=? AND source_contact_id=?""",
+                (link["organisation_id"], link["source_contact_id"])).fetchone()
+            if planned_hash is None or planned_hash["email_sha256"] != email_reference(normalized):
+                raise ValueError("source email changed after planning; rediscover before batching")
+            prior = ledger.execute(
+                """SELECT 1 FROM batch_rows br
+                   LEFT JOIN batch_row_sources bs ON bs.batch_id=br.batch_id
+                    AND bs.csv_row_number=br.csv_row_number
+                   WHERE br.state IN ('submitted','rejected') AND
+                    ((br.organisation_id=? AND br.source_activity_id=? AND br.source_contact_id=?) OR
+                     (bs.organisation_id=? AND bs.source_activity_id=? AND bs.source_contact_id=?))""",
+                (link["organisation_id"], link["source_activity_id"], link["source_contact_id"],
+                 link["organisation_id"], link["source_activity_id"], link["source_contact_id"])).fetchone()
+            if prior:
+                continue
+            prepared.append((link, source_row, normalized))
+        groups = []
+        if sandbox_collapse_by_email:
+            grouped = {}
+            for item in prepared:
+                key = (item[0]["organisation_id"], item[0]["source_activity_id"], item[2])
+                grouped.setdefault(key, []).append(item)
+            groups = list(grouped.values())
+        else:
+            groups = [[item] for item in prepared]
         selected_counts = {
-            "row_count": len(links),
+            "row_count": len(groups),
             "unique_source_activities": len({
-                (row["organisation_id"], row["source_activity_id"]) for row in links
+                (row[0]["organisation_id"], row[0]["source_activity_id"]) for row in prepared
             }),
         }
+        if sandbox_collapse_by_email:
+            selected_counts.update(source_link_count=len(prepared),
+                                   collapsed_row_total=len(prepared) - len(groups))
         # This output deliberately precedes mkdir/open: operators see precisely
         # what will be emitted before any generated artifact exists.
         print(json.dumps({"selection": exact_selection, "counts": selected_counts},
                          sort_keys=True))
-        if not links:
+        if not groups:
             raise ValueError("selection produced no importable rows; no batch was created")
         batch_directory.mkdir(parents=False)
         csv_path = batch_directory / "activities.csv"
@@ -584,31 +676,8 @@ def generate_batch(
         with csv_path.open("x", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
             writer.writeheader()
-            for csv_row_number, link in enumerate(links, start=2):
-                source_row = source.execute(
-                    """SELECT c.email, n.text
-                    FROM JobAdderNotes n
-                    JOIN JobAdderNoteContacts nc
-                      ON nc.JobAdderOrganisationId = n.JobAdderOrganisationId
-                     AND nc.noteId = n.noteId
-                    JOIN JobAdderContacts c
-                      ON c.JobAdderOrganisationId = nc.JobAdderOrganisationId
-                     AND c.contactId = nc.contactId
-                    WHERE n.JobAdderOrganisationId = ? AND n.Id = ?
-                      AND nc.contactId = ?""",
-                    (link["organisation_id"], link["source_activity_id"],
-                     link["source_contact_id"]),
-                ).fetchone()
-                normalized_email = normalize_email(source_row["email"] if source_row else None)
-                if normalized_email is None:
-                    raise ValueError("eligible pair has blank or invalid source contact email")
-                planned_hash = ledger.execute(
-                    """SELECT email_sha256 FROM contact_email_plans
-                       WHERE organisation_id=? AND source_contact_id=?""",
-                    (link["organisation_id"], link["source_contact_id"]),
-                ).fetchone()
-                if planned_hash is None or planned_hash["email_sha256"] != email_reference(normalized_email):
-                    raise ValueError("source email changed after planning; rediscover before batching")
+            for csv_row_number, group in enumerate(groups, start=2):
+                link, source_row, normalized_email = group[0]
                 output_row = {
                     "Contact email": normalized_email,
                     # JobAdder represents all of these history items as notes. The
@@ -628,6 +697,11 @@ def generate_batch(
                         "source_activity_id": link["source_activity_id"],
                         "source_contact_id": link["source_contact_id"],
                     },
+                    "source_keys": [{
+                        "organisation_id": member[0]["organisation_id"],
+                        "source_activity_id": member[0]["source_activity_id"],
+                        "source_contact_id": member[0]["source_contact_id"],
+                    } for member in group],
                     "row_sha256": hashlib.sha256(json.dumps(
                         output_row, sort_keys=True, separators=(",", ":")
                     ).encode("utf-8")).hexdigest(),
@@ -658,6 +732,11 @@ def generate_batch(
             "result_counts": None,
             "operator_notes": operator_notes,
             "counts": selected_counts,
+            "sandbox_policy": ({
+                "name": "collapse_by_normalized_email",
+                "grouping_key": ["organisation_id", "source_activity_id", "normalized_email"],
+                "requires_render_as_notes": True,
+            } if sandbox_collapse_by_email else None),
             "rows": audit_rows,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -667,12 +746,15 @@ def generate_batch(
                    (batch_id, csv_file, csv_sha256, manifest_file, status, created_at_utc,
                     environment, target_portal_label, selection_filters_json,
                     mapping_hash, source_data_fingerprint, row_count, review_status,
-                    operator_notes)
-                   VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                    operator_notes, sandbox_policy_json, source_link_count,
+                    collapsed_row_total)
+                   VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
                 (batch_id, csv_path.name, csv_hash, manifest_path.name,
                  manifest["generated_at_utc"], environment, target_portal_label,
                  json.dumps(exact_selection, sort_keys=True), mapping_hash, source_hash,
-                 len(audit_rows), operator_notes),
+                 len(audit_rows), operator_notes,
+                 json.dumps(manifest["sandbox_policy"], sort_keys=True) if sandbox_collapse_by_email else None,
+                 len(prepared), len(prepared) - len(groups)),
             )
             for item in audit_rows:
                 key = item["source_key"]
@@ -685,6 +767,13 @@ def generate_batch(
                      key["source_activity_id"], key["source_contact_id"],
                      item["row_sha256"]),
                 )
+                for source_key in item["source_keys"]:
+                    ledger.execute(
+                        """INSERT INTO batch_row_sources
+                           (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id)
+                           VALUES (?,?,?,?,?)""",
+                        (batch_id, item["csv_row_number"], source_key["organisation_id"],
+                         source_key["source_activity_id"], source_key["source_contact_id"]))
         # Generation is append-only: review never needs to edit either artifact.
         csv_path.chmod(0o444)
         manifest_path.chmod(0o444)
@@ -918,6 +1007,10 @@ def parse_args() -> argparse.Namespace:
         "--render-as-notes", action="store_true",
         help="render every selected importable activity as NOTE without changing its audited mapping",
     )
+    batch.add_argument(
+        "--sandbox-collapse-by-email", action="store_true",
+        help="sandbox-only: collapse activity/contact links by normalized email",
+    )
     state = commands.add_parser("record-batch-state")
     state.add_argument("ledger", type=Path)
     state.add_argument("batch_id")
@@ -982,7 +1075,8 @@ def main() -> int:
             args.database, args.ledger, args.batch_directory, args.batch_id,
             environment=args.environment, target_portal_label=args.target_portal_label,
             selection=selection, operator_notes=args.operator_notes,
-            render_as_notes=args.render_as_notes)))
+            render_as_notes=args.render_as_notes,
+            sandbox_collapse_by_email=args.sandbox_collapse_by_email)))
     return 0
 
 
