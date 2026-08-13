@@ -48,6 +48,7 @@ QUOTED_HISTORY_VERSION = "quoted-history-v1-window-8"
 DUPLICATE_POLICY_VERSION = "note-strict-v1"
 NOTES_ONLY_POLICY_VERSION = "notes-only-approved-v1"
 SANDBOX_EMAIL_COLLAPSE_POLICY_VERSION = "sandbox-collapse-by-email-v1"
+TOOL_VERSION = "migration-ledger-supersession-v1"
 QUOTED_HEADER_WINDOW = 8
 
 
@@ -176,7 +177,8 @@ def mapping_fingerprint(path: Path) -> str:
 def open_ledger(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path.expanduser().resolve())
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    # Foreign keys are enabled after the append-only schema upgrades below.
+    connection.execute("PRAGMA foreign_keys = OFF")
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS activity_links (
@@ -220,7 +222,7 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS batches (
             batch_id TEXT PRIMARY KEY,
             csv_file TEXT NOT NULL,
-            csv_sha256 TEXT NOT NULL UNIQUE,
+            csv_sha256 TEXT NOT NULL,
             manifest_file TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN
                 ('planned', 'reviewed', 'submitted', 'confirmed_by_import',
@@ -253,8 +255,12 @@ def open_ledger(path: Path) -> sqlite3.Connection:
                  'confirmed_by_export_sample', 'confirmed_manually',
                  'reconciliation_required', 'rejected')),
             hubspot_activity_id TEXT,
+            supersedes_batch_id TEXT,
+            prior_csv_row_number INTEGER,
+            body_transformation_version TEXT NOT NULL DEFAULT '',
+            regeneration_reason TEXT,
             PRIMARY KEY (batch_id, csv_row_number),
-            UNIQUE (organisation_id, source_activity_id, source_contact_id)
+            UNIQUE (batch_id, organisation_id, source_activity_id, source_contact_id)
         );
         CREATE TABLE IF NOT EXISTS batch_row_sources (
             batch_id TEXT NOT NULL,
@@ -325,7 +331,10 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             duplicate_policy_version TEXT NOT NULL,
             outcome TEXT NOT NULL,
             reason_code TEXT,
-            PRIMARY KEY (organisation_id, source_activity_id, source_contact_id)
+            recorded_at_utc TEXT NOT NULL,
+            PRIMARY KEY (organisation_id, source_activity_id, source_contact_id,
+                         body_transformation_version, extraction_rule_version,
+                         duplicate_policy_version)
         );
         """
     )
@@ -342,6 +351,12 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         "hubspot_import_name": "TEXT", "import_started_at_utc": "TEXT",
         "import_completed_at_utc": "TEXT", "result_counts_json": "TEXT",
         "operator_notes": "TEXT",
+        "supersedes_batch_id": "TEXT",
+        "supersedes_policy_version": "TEXT",
+        "body_transformation_version": "TEXT NOT NULL DEFAULT ''",
+        "regeneration_reason": "TEXT",
+        "cutoff_context_json": "TEXT NOT NULL DEFAULT '{}'",
+        "tool_version": "TEXT NOT NULL DEFAULT ''",
         "submitted_by": "TEXT",
         "sandbox_policy": "TEXT",
         "collapsed_source_row_count": "INTEGER NOT NULL DEFAULT 0",
@@ -352,6 +367,62 @@ def open_ledger(path: Path) -> sqlite3.Connection:
     row_columns = {row[1] for row in connection.execute("PRAGMA table_info(batch_rows)")}
     if "hubspot_activity_id" not in row_columns:
         connection.execute("ALTER TABLE batch_rows ADD COLUMN hubspot_activity_id TEXT")
+    for name, declaration in {
+        "supersedes_batch_id": "TEXT", "prior_csv_row_number": "INTEGER",
+        "body_transformation_version": "TEXT NOT NULL DEFAULT ''",
+        "regeneration_reason": "TEXT",
+    }.items():
+        if name not in row_columns:
+            connection.execute(f"ALTER TABLE batch_rows ADD COLUMN {name} {declaration}")
+    # Early ledgers enforced source-key uniqueness globally. Rebuild only that
+    # structural table so existing rows retain their IDs, hashes, and states.
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='batch_rows'"
+    ).fetchone()[0]
+    if "UNIQUE (organisation_id, source_activity_id, source_contact_id)" in table_sql:
+        connection.executescript("""
+            ALTER TABLE batch_row_sources RENAME TO batch_row_sources_legacy;
+            ALTER TABLE batch_rows RENAME TO batch_rows_legacy;
+            CREATE TABLE batch_rows (
+                batch_id TEXT NOT NULL REFERENCES batches(batch_id), csv_row_number INTEGER NOT NULL,
+                organisation_id INTEGER NOT NULL, source_activity_id TEXT NOT NULL,
+                source_contact_id TEXT NOT NULL, row_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                hubspot_activity_id TEXT, supersedes_batch_id TEXT, prior_csv_row_number INTEGER,
+                body_transformation_version TEXT NOT NULL DEFAULT '', regeneration_reason TEXT,
+                PRIMARY KEY(batch_id,csv_row_number),
+                UNIQUE(batch_id,organisation_id,source_activity_id,source_contact_id));
+            INSERT INTO batch_rows SELECT * FROM batch_rows_legacy;
+            CREATE TABLE batch_row_sources (
+                batch_id TEXT NOT NULL, csv_row_number INTEGER NOT NULL, organisation_id INTEGER NOT NULL,
+                source_activity_id TEXT NOT NULL, source_contact_id TEXT NOT NULL,
+                PRIMARY KEY(batch_id,organisation_id,source_activity_id,source_contact_id),
+                FOREIGN KEY(batch_id,csv_row_number) REFERENCES batch_rows(batch_id,csv_row_number));
+            INSERT INTO batch_row_sources SELECT * FROM batch_row_sources_legacy;
+            DROP TABLE batch_row_sources_legacy; DROP TABLE batch_rows_legacy;
+            CREATE INDEX batch_row_sources_source_key ON batch_row_sources
+                (organisation_id,source_activity_id,source_contact_id);
+        """)
+    processing_columns = {row[1] for row in connection.execute(
+        "PRAGMA table_info(note_processing)")}
+    if "recorded_at_utc" not in processing_columns:
+        connection.executescript("""
+            ALTER TABLE note_processing RENAME TO note_processing_legacy;
+            CREATE TABLE note_processing (
+              organisation_id INTEGER NOT NULL, source_contact_id TEXT NOT NULL,
+              source_activity_id TEXT NOT NULL, raw_body_sha256 TEXT NOT NULL,
+              raw_character_count INTEGER NOT NULL, transformed_body_sha256 TEXT,
+              transformed_character_count INTEGER, body_transformation_version TEXT NOT NULL,
+              extraction_rule_version TEXT NOT NULL, boundary_outcome TEXT NOT NULL,
+              boundary_reason_code TEXT NOT NULL, target_activity_type TEXT NOT NULL,
+              comparison_key_sha256 TEXT, survivor_reference_sha256 TEXT,
+              duplicate_policy_version TEXT NOT NULL, outcome TEXT NOT NULL, reason_code TEXT,
+              recorded_at_utc TEXT NOT NULL,
+              PRIMARY KEY(organisation_id,source_activity_id,source_contact_id,
+                body_transformation_version,extraction_rule_version,duplicate_policy_version));
+            INSERT INTO note_processing SELECT *, '' FROM note_processing_legacy;
+            DROP TABLE note_processing_legacy;
+        """)
+    connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
@@ -680,10 +751,21 @@ def generate_batch(
     target_portal_label: str = "unspecified", selection: dict | None = None,
     operator_notes: str | None = None, render_as_notes: bool = False,
     sandbox_collapse_by_email: bool = False,
+    regenerate: bool = False, supersedes_batch_id: str | None = None,
+    supersedes_policy_version: str | None = None,
+    regeneration_reason: str | None = None,
 ) -> dict[str, int]:
     """Generate one dry-run-only, immutable notes CSV; never submit an import."""
     selection = selection or {}
     batch_id = batch_id or str(uuid.uuid4())
+    lineage_identifiers = bool(supersedes_batch_id) + bool(supersedes_policy_version)
+    if regenerate:
+        if lineage_identifiers != 1:
+            raise ValueError("regeneration requires exactly one prior batch or policy version")
+        if not (regeneration_reason or "").strip():
+            raise ValueError("regeneration requires a nonblank operator reason")
+    elif lineage_identifiers or regeneration_reason:
+        raise ValueError("supersession options require explicit regeneration")
     if sandbox_collapse_by_email and environment != "sandbox":
         raise ValueError("--sandbox-collapse-by-email requires --environment sandbox")
     if sandbox_collapse_by_email and not render_as_notes:
@@ -696,7 +778,44 @@ def generate_batch(
         validate_database(source)
         if ledger.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone():
             raise ValueError("batch_id has already been used; choose a new batch ID")
-        if sandbox_collapse_by_email:
+        prior_batches = []
+        if regenerate:
+            if supersedes_batch_id:
+                prior_batches = list(ledger.execute(
+                    "SELECT * FROM batches WHERE batch_id=?", (supersedes_batch_id,)))
+                if not prior_batches:
+                    raise ValueError("superseded batch does not exist")
+            else:
+                prior_batches = list(ledger.execute(
+                    "SELECT * FROM batches WHERE body_transformation_version=?",
+                    (supersedes_policy_version,)))
+                if not prior_batches:
+                    raise ValueError("superseded policy version has no batches")
+            unsafe = [row["batch_id"] for row in prior_batches
+                      if row["status"] != "planned" or row["import_id"] is not None]
+            if unsafe:
+                print("Batch preflight: 0 already batched under the current policy; "
+                      "0 eligible for controlled regeneration from an older policy; "
+                      f"{len(unsafe)} blocked because prior import state is unsafe.",
+                      file=sys.stderr, flush=True)
+                raise ValueError("regeneration blocked because prior import state is unsafe: "
+                                 + ", ".join(unsafe))
+        prior_ids = [row["batch_id"] for row in prior_batches]
+        if regenerate:
+            placeholders = ",".join("?" for _ in prior_ids)
+            base_links = list(importable_links(ledger, selection))
+            prior_keys = {(row["organisation_id"], row["source_activity_id"],
+                           row["source_contact_id"]): row
+                          for row in ledger.execute(f"""SELECT bs.*, br.csv_row_number
+                            FROM batch_row_sources bs JOIN batch_rows br
+                              ON br.batch_id=bs.batch_id AND br.csv_row_number=bs.csv_row_number
+                            WHERE bs.batch_id IN ({placeholders})""", prior_ids)}
+            current_keys = {tuple(row) for row in ledger.execute("""SELECT organisation_id,
+                    source_activity_id,source_contact_id FROM batch_rows
+                    WHERE body_transformation_version=?""", (BODY_TRANSFORMATION_VERSION,))}
+            links = [link for link in base_links if _source_key(link) in prior_keys
+                     and _source_key(link) not in current_keys]
+        elif sandbox_collapse_by_email:
             # This deliberately broadens only the association boundary for the
             # explicit sandbox policy. All other exclusion states remain out.
             links = list(importable_links(
@@ -713,9 +832,14 @@ def generate_batch(
                       if sandbox_collapse_by_email else IMPORTABLE_STATUSES),
         ))
         previously_batched = eligible_before_prior_batches - len(links)
+        current_policy_count = (sum(_source_key(link) in current_keys for link in base_links)
+                                if regenerate else previously_batched)
+        controlled_count = len(links) if regenerate else 0
         print(
             f"Batch preflight: {eligible_before_prior_batches} importable pair(s); "
-            f"{previously_batched} already in immutable batches; "
+            f"{current_policy_count} already batched under the current policy; "
+            f"{controlled_count} eligible for controlled regeneration from an older policy; "
+            "0 blocked because prior import state is unsafe; "
             f"{len(links)} remaining to process.",
             file=sys.stderr, flush=True,
         )
@@ -873,13 +997,14 @@ def generate_batch(
         with ledger:
             for item in candidates:
                 link = item["link"]
-                ledger.execute("""INSERT OR REPLACE INTO note_processing VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NOTE', ?, ?, ?, ?, ?)""",
+                ledger.execute("""INSERT OR IGNORE INTO note_processing VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NOTE', ?, ?, ?, ?, ?, ?)""",
                     (link["organisation_id"], link["source_contact_id"], link["source_activity_id"],
                      item["raw_hash"], item["raw_count"], item["body_hash"], item["body_count"],
                      BODY_TRANSFORMATION_VERSION, QUOTED_HISTORY_VERSION,
                      item["boundary_outcome"], item["boundary_reason"], item["comparison"],
-                     item.get("survivor"), DUPLICATE_POLICY_VERSION, item["outcome"], item["reason"]))
+                     item.get("survivor"), DUPLICATE_POLICY_VERSION, item["outcome"], item["reason"],
+                     datetime.now(timezone.utc).isoformat()))
                 if item["outcome"] in {"duplicate", "review"}:
                     ledger.execute("""UPDATE activity_links SET status=?, reason_code=?
                         WHERE organisation_id=? AND source_contact_id=? AND source_activity_id=?
@@ -934,6 +1059,14 @@ def generate_batch(
             "body_transformation_version": BODY_TRANSFORMATION_VERSION,
             "quoted_history_version": QUOTED_HISTORY_VERSION,
             "duplicate_policy_version": DUPLICATE_POLICY_VERSION,
+            "supersedes_batch_id": supersedes_batch_id,
+            "supersedes_policy_version": supersedes_policy_version,
+            "regeneration_reason": regeneration_reason,
+            "tool_version": TOOL_VERSION,
+            "cutoff_context": {"date_from": exact_selection["date_from"],
+                               "date_from_inclusive": exact_selection["date_from_inclusive"],
+                               "date_to": exact_selection["date_to"],
+                               "date_to_inclusive": exact_selection["date_to_inclusive"]},
             "notes_only_policy_version": NOTES_ONLY_POLICY_VERSION,
             "sandbox_policy": (SANDBOX_EMAIL_COLLAPSE_POLICY_VERSION
                                if sandbox_collapse_by_email else None),
@@ -946,18 +1079,27 @@ def generate_batch(
             ledger.execute("""INSERT INTO batches
                 (batch_id,csv_file,csv_sha256,manifest_file,status,created_at_utc,environment,
                  target_portal_label,selection_filters_json,mapping_hash,source_data_fingerprint,
-                 row_count,review_status,operator_notes,sandbox_policy,collapsed_source_row_count)
-                 VALUES (?,?,?,?, 'planned',?,?,?,?,?,?,?,'pending',?,?,?)""",
+                 row_count,review_status,operator_notes,sandbox_policy,collapsed_source_row_count,
+                 supersedes_batch_id,supersedes_policy_version,body_transformation_version,
+                 regeneration_reason,cutoff_context_json,tool_version)
+                 VALUES (?,?,?,?, 'planned',?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?,?)""",
                 (batch_id, "notes.csv", csv_hash, "manifest.json", now, environment,
                  target_portal_label, json.dumps(exact_selection, sort_keys=True),
                  manifest["mapping_hash"], source_hash, len(audit_rows), operator_notes,
-                 manifest["sandbox_policy"], collapsed_source_rows))
+                 manifest["sandbox_policy"], collapsed_source_rows, supersedes_batch_id,
+                 supersedes_policy_version, BODY_TRANSFORMATION_VERSION, regeneration_reason,
+                 json.dumps(manifest["cutoff_context"], sort_keys=True), TOOL_VERSION))
             for item in audit_rows:
                 key=item["source_key"]
                 ledger.execute("""INSERT INTO batch_rows
-                    (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id,row_sha256,state)
-                    VALUES (?,?,?,?,?,?,'planned')""", (batch_id,item["csv_row_number"],key["organisation_id"],
-                    key["source_activity_id"],key["source_contact_id"],item["row_sha256"]))
+                    (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id,row_sha256,state,
+                     supersedes_batch_id,prior_csv_row_number,body_transformation_version,regeneration_reason)
+                    VALUES (?,?,?,?,?,?,'planned',?,?,?,?)""", (batch_id,item["csv_row_number"],key["organisation_id"],
+                    key["source_activity_id"],key["source_contact_id"],item["row_sha256"],
+                    (prior_keys[(key["organisation_id"], key["source_activity_id"],
+                                 key["source_contact_id"])]["batch_id"] if regenerate else None),
+                    (prior_keys.get((key["organisation_id"], key["source_activity_id"], key["source_contact_id"]), {})
+                     ["csv_row_number"] if regenerate else None), BODY_TRANSFORMATION_VERSION, regeneration_reason))
                 for source_key in item["contributing_source_keys"]:
                     ledger.execute("""INSERT INTO batch_row_sources
                         (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id)
@@ -1187,6 +1329,12 @@ def parse_args() -> argparse.Namespace:
     batch.add_argument("--date-to")
     batch.add_argument("--date-to-exclusive", action="store_true")
     batch.add_argument("--operator-notes")
+    batch.add_argument("--regenerate", action="store_true",
+                       help="create a new immutable version from a safe prior batch/policy")
+    lineage = batch.add_mutually_exclusive_group()
+    lineage.add_argument("--supersedes-batch-id")
+    lineage.add_argument("--supersedes-policy-version")
+    batch.add_argument("--regeneration-reason")
     batch.add_argument(
         "--render-as-notes", action="store_true",
         help="render every selected importable activity as NOTE without changing its audited mapping",
@@ -1261,7 +1409,10 @@ def main() -> int:
             environment=args.environment, target_portal_label=args.target_portal_label,
             selection=selection, operator_notes=args.operator_notes,
             render_as_notes=args.render_as_notes,
-            sandbox_collapse_by_email=args.sandbox_collapse_by_email)))
+            sandbox_collapse_by_email=args.sandbox_collapse_by_email,
+            regenerate=args.regenerate, supersedes_batch_id=args.supersedes_batch_id,
+            supersedes_policy_version=args.supersedes_policy_version,
+            regeneration_reason=args.regeneration_reason)))
     return 0
 
 

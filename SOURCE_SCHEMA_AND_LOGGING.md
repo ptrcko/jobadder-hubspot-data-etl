@@ -316,3 +316,12 @@ an existing `note-body-v1` batch or historical audit artifact. Any regeneration
 must create a new immutable batch, record `note-body-v2-email-subject`, the
 source/mapping fingerprints, cutoff and tool context, and the policy-change
 reason, and re-evaluate duplicate outcomes against the newly transformed body.
+Controlled supersession is disabled by default. An operator must identify one
+prior batch or transformation-policy version and record a reason. Generation is
+limited to rows in `planned`, never-submitted batches and excludes rows already
+represented under the current transformation. Submitted, confirmed, partial,
+and unknown-outcome batches are unsafe until a separately documented
+reconciliation proves otherwise. `batch_rows` is unique only within its batch;
+supersession fields link each new row to its prior immutable row, while versioned
+`note_processing` records preserve both transformations. HubSpot CSV import is
+not idempotent, so this lineage does not make an unproven import safe to retry.
