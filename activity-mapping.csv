@@ -1,22 +1,22 @@
 jobadder_type,jobadder_source,classification,reason
-Outbound Call,*,CALL,Genuine outbound telephone activity
-Inbound Call,*,CALL,Genuine inbound telephone activity
-Phone call,*,CALL,Telephone activity
-Phone call - KIT Client Call (Keep in Touch),*,CALL,Keep-in-touch telephone activity
-Missed Call,*,CALL,Telephone activity
-Left message,*,CALL,Telephone attempt
-Left message OR No Answer,*,CALL,Telephone attempt
-Client Relationship Call (CRC),Note,CALL,Relationship telephone activity
-Intro Business Call,*,CALL,Introductory telephone activity
-Intro New Business Client Relationship Call,*,CALL,Introductory telephone activity
-Email sent,Email,OUTBOUND_EMAIL,Email source and sent type
-Sent email,Email,OUTBOUND_EMAIL,Email source and sent type
-Sent email,Note,OUTBOUND_EMAIL,SourceWhale or manually captured outbound email
-Email Received,Email,INBOUND_EMAIL,Samples confirm received email
-Received email,Email,INBOUND_EMAIL,Received email
-Received email,Note,INBOUND_EMAIL,SourceWhale or manually captured received email
-Email Reply,Email,OUTBOUND_EMAIL,Reply sent by Sapture to the contact
-Email Reply,Note,OUTBOUND_EMAIL,Reply sent by Sapture to the contact
+Outbound Call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Inbound Call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Phone call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Phone call - KIT Client Call (Keep in Touch),*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Missed Call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Left message,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Left message OR No Answer,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Client Relationship Call (CRC),Note,NOTE,Approved notes-only migration policy preserves this activity as a note
+Intro Business Call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Intro New Business Client Relationship Call,*,NOTE,Approved notes-only migration policy preserves this activity as a note
+Email sent,Email,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Sent email,Email,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Sent email,Note,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Email Received,Email,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Received email,Email,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Received email,Note,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Email Reply,Email,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
+Email Reply,Note,NOTE,Notes-only policy; authoritative email-envelope metadata is unavailable
 LinkedIn InMail / LinkedIn Other,*,NOTE,LinkedIn interaction
 LinkedIn Inmail,*,NOTE,LinkedIn interaction
 Sent LinkedIn voice note,*,NOTE,LinkedIn interaction
