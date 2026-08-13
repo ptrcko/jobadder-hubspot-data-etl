@@ -147,6 +147,22 @@ records `output_activity_type` as `NOTE`. Unresolved shared-email exceptions
 still block generation until each email hash has an explicitly reviewed
 `approve_import` or `exclude` policy decision.
 
+For sandbox-volume testing only, `--sandbox-collapse-by-email` may be added to
+that command. The option is rejected unless both `--environment sandbox` and
+`--render-as-notes` are present. It treats JobAdder contact IDs with the same
+normalized email as one target for each source activity, while a copied activity
+still produces one note for every distinct email. This sandbox exception does
+not make excluded, review, invalid-email, blank-body, unmatched, previously
+batched/submitted, or rejected source rows eligible.
+
+The manifest identifies the versioned sandbox policy, reports the number of
+collapsed source associations, and retains every contributing composite source
+key beside the emitted CSV row. The ledger stores the same policy and totals as
+well as the complete row-to-source-key relationship, so a later run cannot
+silently re-emit a collapsed contributor. This is an explicit sandbox policy,
+not an idempotency guarantee or a replacement for production shared-email
+decisions.
+
 ## Content policy
 
 Visible activity bodies must not add `JobAdder call`, `JobAdder email`, `JobAdder activity`, source IDs, migration references, or similar migration labels. This restriction applies to migration-added text: legitimate original content that mentions JobAdder must remain unchanged.

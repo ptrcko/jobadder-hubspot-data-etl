@@ -377,11 +377,12 @@ class MigrationLedgerTests(unittest.TestCase):
             environment="sandbox", target_portal_label="synthetic-sandbox",
             render_as_notes=True,
         )
-        self.assertEqual(counts, {"row_count": 1, "unique_source_activities": 1})
-        with (directory / "activities.csv").open(
+        self.assertEqual(counts["row_count"], 1)
+        self.assertEqual(counts["unique_source_activities"], 1)
+        with (directory / "notes.csv").open(
                 encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
-        self.assertEqual(rows[0]["Activity type"], "NOTE")
+        self.assertEqual(rows[0]["Email <CONTACT email>"], "synthetic@example.test")
         manifest = json.loads((directory / "manifest.json").read_text())
         self.assertEqual(manifest["selection_filters"]["output_activity_type"], "NOTE")
         ledger = open_ledger(self.ledger)
@@ -390,6 +391,85 @@ class MigrationLedgerTests(unittest.TestCase):
             "CALL",
         )
         ledger.close()
+
+    def _sandbox_collapsed_batch(self, name="collapsed"):
+        directory = Path(self.temp.name) / name
+        counts = generate_batch(
+            self.source, self.ledger, directory, name,
+            environment="sandbox", target_portal_label="synthetic-sandbox",
+            render_as_notes=True, sandbox_collapse_by_email=True,
+        )
+        with (directory / "notes.csv").open(
+                encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        return directory, counts, rows
+
+    def test_sandbox_collapses_shared_email_and_audits_every_source_key(self):
+        source = sqlite3.connect(self.source)
+        source.execute("INSERT INTO JobAdderContacts VALUES (12, ' SYNTHETIC@EXAMPLE.TEST ', 1)")
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1001, 12, 1)")
+        source.commit(); source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+
+        directory, counts, rows = self._sandbox_collapsed_batch()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(counts["collapsed_source_rows"], 1)
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["sandbox_policy"], "sandbox-collapse-by-email-v1")
+        self.assertEqual(
+            {key["source_contact_id"] for key in manifest["rows"][0]["contributing_source_keys"]},
+            {"11", "12"},
+        )
+        ledger = open_ledger(self.ledger)
+        batch = ledger.execute("SELECT * FROM batches WHERE batch_id='collapsed'").fetchone()
+        self.assertEqual((batch["sandbox_policy"], batch["collapsed_source_row_count"]),
+                         ("sandbox-collapse-by-email-v1", 1))
+        self.assertEqual(ledger.execute("SELECT COUNT(*) FROM batch_row_sources").fetchone()[0], 2)
+        ledger.close()
+
+    def test_sandbox_copied_activity_keeps_distinct_recipient_emails(self):
+        source = sqlite3.connect(self.source)
+        source.execute("INSERT INTO JobAdderContacts VALUES (12, 'second@example.test', 1)")
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1001, 12, 1)")
+        source.commit(); source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        _, counts, rows = self._sandbox_collapsed_batch()
+        self.assertEqual(counts["row_count"], 2)
+        self.assertEqual({row["Email <CONTACT email>"] for row in rows},
+                         {"synthetic@example.test", "second@example.test"})
+
+    def test_sandbox_keeps_distinct_activities_with_identical_bodies(self):
+        source = sqlite3.connect(self.source)
+        source.execute("INSERT INTO JobAdderNotes VALUES (102,1002,'Phone Call','User','synthetic',2000,1)")
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1002,11,1)")
+        source.commit(); source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        _, counts, rows = self._sandbox_collapsed_batch()
+        self.assertEqual(counts["row_count"], 2)
+        self.assertEqual(len(rows), 2)
+
+    def test_sandbox_excludes_all_contributors_after_submission(self):
+        source = sqlite3.connect(self.source)
+        source.execute("INSERT INTO JobAdderContacts VALUES (12, 'synthetic@example.test', 1)")
+        source.execute("INSERT INTO JobAdderNoteContacts VALUES (1001, 12, 1)")
+        source.commit(); source.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        self._sandbox_collapsed_batch("first")
+        record_batch_state(self.ledger, "first", "reviewed", reviewer="Reviewer")
+        record_batch_state(self.ledger, "first", "submitted", import_id="sandbox-import",
+                           operator="Operator")
+        with self.assertRaisesRegex(ValueError, "no importable rows"):
+            self._sandbox_collapsed_batch("second")
+
+    def test_sandbox_collapse_rejected_outside_sandbox_or_without_notes(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        with self.assertRaisesRegex(ValueError, "environment sandbox"):
+            generate_batch(self.source, self.ledger, Path(self.temp.name) / "production",
+                           environment="production", render_as_notes=True,
+                           sandbox_collapse_by_email=True)
+        with self.assertRaisesRegex(ValueError, "render-as-notes"):
+            generate_batch(self.source, self.ledger, Path(self.temp.name) / "not-notes",
+                           environment="sandbox", sandbox_collapse_by_email=True)
 
 
 if __name__ == "__main__":

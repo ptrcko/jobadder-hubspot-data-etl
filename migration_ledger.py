@@ -46,6 +46,7 @@ BODY_TRANSFORMATION_VERSION = "note-body-v1"
 QUOTED_HISTORY_VERSION = "quoted-history-v1-window-8"
 DUPLICATE_POLICY_VERSION = "note-strict-v1"
 NOTES_ONLY_POLICY_VERSION = "notes-only-approved-v1"
+SANDBOX_EMAIL_COLLAPSE_POLICY_VERSION = "sandbox-collapse-by-email-v1"
 QUOTED_HEADER_WINDOW = 8
 
 
@@ -236,6 +237,16 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             PRIMARY KEY (batch_id, csv_row_number),
             UNIQUE (organisation_id, source_activity_id, source_contact_id)
         );
+        CREATE TABLE IF NOT EXISTS batch_row_sources (
+            batch_id TEXT NOT NULL,
+            csv_row_number INTEGER NOT NULL,
+            organisation_id INTEGER NOT NULL,
+            source_activity_id TEXT NOT NULL,
+            source_contact_id TEXT NOT NULL,
+            PRIMARY KEY (batch_id, organisation_id, source_activity_id, source_contact_id),
+            FOREIGN KEY (batch_id, csv_row_number)
+                REFERENCES batch_rows(batch_id, csv_row_number)
+        );
         CREATE TABLE IF NOT EXISTS import_reconciliations (
             id INTEGER PRIMARY KEY,
             batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -310,6 +321,8 @@ def open_ledger(path: Path) -> sqlite3.Connection:
         "import_completed_at_utc": "TEXT", "result_counts_json": "TEXT",
         "operator_notes": "TEXT",
         "submitted_by": "TEXT",
+        "sandbox_policy": "TEXT",
+        "collapsed_source_row_count": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in additions.items():
         if name not in existing:
@@ -498,13 +511,15 @@ def migration_counts(connection: sqlite3.Connection) -> dict[str, int]:
     return {key: int(row[key] or 0) for key in row.keys()}
 
 
-def importable_links(connection: sqlite3.Connection, selection: dict | None = None):
+def importable_links(connection: sqlite3.Connection, selection: dict | None = None,
+                     *, statuses: set[str] | None = None):
     """Yield only links approved for normalized exact-email association.
 
     CSV generators must use this boundary rather than selecting ledger rows
     directly.  Unmatched contacts can therefore never leak into an import file.
     """
-    status_placeholders = ",".join("?" for _ in IMPORTABLE_STATUSES)
+    statuses = statuses or IMPORTABLE_STATUSES
+    status_placeholders = ",".join("?" for _ in statuses)
     mapping_placeholders = ",".join("?" for _ in IMPORTABLE_MAPPING_DECISIONS)
     selection = selection or {}
     clauses, values = [], []
@@ -532,7 +547,7 @@ def importable_links(connection: sqlite3.Connection, selection: dict | None = No
           AND mapping_decision IN ({mapping_placeholders})
           {extra}
         ORDER BY source_activity_id, source_contact_id""",
-        (*sorted(IMPORTABLE_STATUSES), *sorted(IMPORTABLE_MAPPING_DECISIONS), *values),
+        (*sorted(statuses), *sorted(IMPORTABLE_MAPPING_DECISIONS), *values),
     )
 
 
@@ -629,10 +644,15 @@ def generate_batch(
     batch_id: str | None = None, *, environment: str = "sandbox",
     target_portal_label: str = "unspecified", selection: dict | None = None,
     operator_notes: str | None = None, render_as_notes: bool = False,
+    sandbox_collapse_by_email: bool = False,
 ) -> dict[str, int]:
     """Generate one dry-run-only, immutable notes CSV; never submit an import."""
     selection = selection or {}
     batch_id = batch_id or str(uuid.uuid4())
+    if sandbox_collapse_by_email and environment != "sandbox":
+        raise ValueError("--sandbox-collapse-by-email requires --environment sandbox")
+    if sandbox_collapse_by_email and not render_as_notes:
+        raise ValueError("--sandbox-collapse-by-email requires --render-as-notes")
     if batch_directory.exists():
         raise FileExistsError("batch directory already exists; create a new batch")
     source = open_read_only(source_path)
@@ -641,17 +661,28 @@ def generate_batch(
         validate_database(source)
         if ledger.execute("SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone():
             raise ValueError("batch_id has already been used; choose a new batch ID")
-        links = list(importable_links(ledger, selection))
+        if sandbox_collapse_by_email:
+            # This deliberately broadens only the association boundary for the
+            # explicit sandbox policy. All other exclusion states remain out.
+            links = list(importable_links(
+                ledger, selection,
+                statuses=IMPORTABLE_STATUSES | {"shared_email_exception"},
+            ))
+        else:
+            links = list(importable_links(ledger, selection))
         # A source pair already in an immutable batch cannot silently enter another.
         links = [link for link in links if not ledger.execute(
             """SELECT 1 FROM batch_rows WHERE organisation_id=?
-               AND source_activity_id=? AND source_contact_id=?""", _source_key(link)
+               AND source_activity_id=? AND source_contact_id=?
+               UNION SELECT 1 FROM batch_row_sources WHERE organisation_id=?
+               AND source_activity_id=? AND source_contact_id=?""",
+            (*_source_key(link), *_source_key(link)),
         ).fetchone()]
         selected_emails = {normalize_email(item) for item in selection.get("emails", [])}
         selected_emails.discard(None)
         if selection.get("emails") and len(selected_emails) != len(selection["emails"]):
             raise ValueError("every selected email must be valid")
-        if shared_email_exceptions(ledger):
+        if shared_email_exceptions(ledger) and not sandbox_collapse_by_email:
             raise ValueError("unresolved shared-email exceptions require a policy decision")
 
         candidates = []
@@ -699,6 +730,22 @@ def generate_batch(
             candidates.append(item)
             mapping_hashes.add(link["mapping_fingerprint"])
 
+        # The sandbox policy collapses source associations, not activities. A
+        # copied activity therefore survives once for every distinct email.
+        collapsed_source_rows = 0
+        if sandbox_collapse_by_email:
+            collapsed = {}
+            for item in candidates:
+                key = (int(item["link"]["organisation_id"]),
+                       str(item["link"]["source_activity_id"]), item["email"])
+                if key not in collapsed:
+                    item["contributing_links"] = [item["link"]]
+                    collapsed[key] = item
+                else:
+                    collapsed[key]["contributing_links"].append(item["link"])
+                    collapsed_source_rows += 1
+            candidates = list(collapsed.values())
+
         # Strict duplicate groups choose the lexicographically smallest composite
         # source key. Potential duplicates are held, never automatically removed.
         groups: defaultdict[str, list[dict]] = defaultdict(list)
@@ -706,7 +753,7 @@ def generate_batch(
             if item["outcome"] == "eligible":
                 groups[item["comparison"]].append(item)
         strict_duplicates = 0
-        for group in groups.values():
+        for group in (() if sandbox_collapse_by_email else groups.values()):
             group.sort(key=lambda item: _source_key(item["link"]))
             survivor = group[0]
             for item in group[1:]:
@@ -717,6 +764,8 @@ def generate_batch(
         eligible = [item for item in candidates if item["outcome"] == "eligible"]
         potential = set()
         for i, left in enumerate(eligible):
+            if sandbox_collapse_by_email:
+                break
             for right in eligible[i + 1:]:
                 if left["contact_ref"] != right["contact_ref"]:
                     continue
@@ -750,6 +799,7 @@ def generate_batch(
             "date_to": selection.get("date_to"),
             "date_to_inclusive": selection.get("date_to_inclusive", True),
             "output_activity_type": "NOTE" if render_as_notes else "source_mapping",
+            "sandbox_collapse_by_email": sandbox_collapse_by_email,
         }
         selection_fingerprint = hashlib.sha256(json.dumps(
             exact_selection, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -765,6 +815,8 @@ def generate_batch(
             "ambiguous_trims_held_for_review": held_trim,
             "unmatched_or_ambiguous_contacts": ledger.execute(
                 "SELECT COUNT(*) FROM activity_links WHERE status NOT IN ('approved_email_match','shared_email_policy_approved')").fetchone()[0],
+            "collapsed_source_rows": collapsed_source_rows,
+            "pre_collapse_eligible_rows": len(candidates) + collapsed_source_rows,
         }
         # Persist every considered pair, including review and duplicate outcomes,
         # even when no candidate CSV can safely be created.
@@ -801,10 +853,16 @@ def generate_batch(
                 output = {CSV_FIELDS[0]: item["email"], CSV_FIELDS[1]: item["body"],
                           CSV_FIELDS[2]: link["activity_timestamp"]}
                 writer.writerow(output)
+                contributing = item.get("contributing_links", [link])
+                source_keys = [{"organisation_id": contributor["organisation_id"],
+                                "source_activity_id": contributor["source_activity_id"],
+                                "source_contact_id": contributor["source_contact_id"]}
+                               for contributor in contributing]
                 audit_rows.append({"csv_row_number": number,
                     "source_key": {"organisation_id": link["organisation_id"],
                                    "source_activity_id": link["source_activity_id"],
                                    "source_contact_id": link["source_contact_id"]},
+                    "contributing_source_keys": source_keys,
                     "row_sha256": body_hash(json.dumps(output, sort_keys=True, separators=(",", ":"))),
                     "raw_body_sha256": item["raw_hash"], "raw_character_count": item["raw_count"],
                     "transformed_body_sha256": item["body_hash"],
@@ -823,6 +881,8 @@ def generate_batch(
             "quoted_history_version": QUOTED_HISTORY_VERSION,
             "duplicate_policy_version": DUPLICATE_POLICY_VERSION,
             "notes_only_policy_version": NOTES_ONLY_POLICY_VERSION,
+            "sandbox_policy": (SANDBOX_EMAIL_COLLAPSE_POLICY_VERSION
+                               if sandbox_collapse_by_email else None),
             "timestamp_contract": "UTC ISO-8601 with Z suffix", "row_count": len(audit_rows),
             "reviewer": None, "review_status": "pending", "result_counts": None,
             "operator_notes": operator_notes, "counts": counts, "rows": audit_rows}
@@ -832,16 +892,24 @@ def generate_batch(
             ledger.execute("""INSERT INTO batches
                 (batch_id,csv_file,csv_sha256,manifest_file,status,created_at_utc,environment,
                  target_portal_label,selection_filters_json,mapping_hash,source_data_fingerprint,
-                 row_count,review_status,operator_notes) VALUES (?,?,?,?, 'planned',?,?,?,?,?,?,?,'pending',?)""",
+                 row_count,review_status,operator_notes,sandbox_policy,collapsed_source_row_count)
+                 VALUES (?,?,?,?, 'planned',?,?,?,?,?,?,?,'pending',?,?,?)""",
                 (batch_id, "notes.csv", csv_hash, "manifest.json", now, environment,
                  target_portal_label, json.dumps(exact_selection, sort_keys=True),
-                 manifest["mapping_hash"], source_hash, len(audit_rows), operator_notes))
+                 manifest["mapping_hash"], source_hash, len(audit_rows), operator_notes,
+                 manifest["sandbox_policy"], collapsed_source_rows))
             for item in audit_rows:
                 key=item["source_key"]
                 ledger.execute("""INSERT INTO batch_rows
                     (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id,row_sha256,state)
                     VALUES (?,?,?,?,?,?,'planned')""", (batch_id,item["csv_row_number"],key["organisation_id"],
                     key["source_activity_id"],key["source_contact_id"],item["row_sha256"]))
+                for source_key in item["contributing_source_keys"]:
+                    ledger.execute("""INSERT INTO batch_row_sources
+                        (batch_id,csv_row_number,organisation_id,source_activity_id,source_contact_id)
+                        VALUES (?,?,?,?,?)""", (batch_id, item["csv_row_number"],
+                        source_key["organisation_id"], source_key["source_activity_id"],
+                        source_key["source_contact_id"]))
         csv_path.chmod(0o444); manifest_path.chmod(0o444)
         return counts
     except Exception:
@@ -1069,6 +1137,11 @@ def parse_args() -> argparse.Namespace:
         "--render-as-notes", action="store_true",
         help="render every selected importable activity as NOTE without changing its audited mapping",
     )
+    batch.add_argument(
+        "--sandbox-collapse-by-email", action="store_true",
+        help=("sandbox-only: collapse associations by source activity and normalized "
+              "email; requires --environment sandbox and --render-as-notes"),
+    )
     state = commands.add_parser("record-batch-state")
     state.add_argument("ledger", type=Path)
     state.add_argument("batch_id")
@@ -1133,7 +1206,8 @@ def main() -> int:
             args.database, args.ledger, args.batch_directory, args.batch_id,
             environment=args.environment, target_portal_label=args.target_portal_label,
             selection=selection, operator_notes=args.operator_notes,
-            render_as_notes=args.render_as_notes)))
+            render_as_notes=args.render_as_notes,
+            sandbox_collapse_by_email=args.sandbox_collapse_by_email)))
     return 0
 
 
