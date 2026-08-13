@@ -42,7 +42,7 @@ CSV_FIELDS = [
     "Note body <NOTE hs_note_body>",
     "Activity date <NOTE hs_timestamp>",
 ]
-BODY_TRANSFORMATION_VERSION = "note-body-v1"
+BODY_TRANSFORMATION_VERSION = "note-body-v2-email-subject"
 QUOTED_HISTORY_VERSION = "quoted-history-v1-window-8"
 DUPLICATE_POLICY_VERSION = "note-strict-v1"
 NOTES_ONLY_POLICY_VERSION = "notes-only-approved-v1"
@@ -75,6 +75,24 @@ def normalize_note_body(value: str | None) -> str:
     while output and output[-1] == "":
         output.pop()
     return "\n".join(output)
+
+
+def render_email_subject(
+    text: str | None, subject: str | None, mapping_decision: str
+) -> str:
+    """Prepend a real, nonblank email subject for email-like mappings.
+
+    The source subject is rendered once as a plain ``Subject:`` paragraph.  No
+    attempt is made to infer other envelope fields or remove matching text from
+    the source body: such text is legitimate content and remains unchanged.
+    """
+    body = text or ""
+    if mapping_decision not in {"INBOUND_EMAIL", "OUTBOUND_EMAIL"}:
+        return body
+    if not (subject or "").strip():
+        return body
+    separator = "\n\n" if body else ""
+    return f"Subject: {subject}{separator}{body}"
 
 
 def trim_quoted_history(value: str | None) -> tuple[str | None, str, str]:
@@ -690,7 +708,7 @@ def generate_batch(
         mapping_hashes = set()
         for link in links:
             row = source.execute(
-                """SELECT c.email, n.text FROM JobAdderNotes n
+                """SELECT c.email, n.subject, n.text FROM JobAdderNotes n
                 JOIN JobAdderNoteContacts nc ON nc.JobAdderOrganisationId=n.JobAdderOrganisationId
                   AND nc.noteId=n.noteId
                 JOIN JobAdderContacts c ON c.JobAdderOrganisationId=nc.JobAdderOrganisationId
@@ -711,7 +729,10 @@ def generate_batch(
                 raise ValueError("source email changed after planning; rediscover before batching")
             raw = row["text"] or ""
             retained, boundary_outcome, boundary_reason = trim_quoted_history(raw)
-            normalized = normalize_note_body(retained) if retained is not None else None
+            rendered = (render_email_subject(retained, row["subject"],
+                                             link["mapping_decision"])
+                        if retained is not None else None)
+            normalized = normalize_note_body(rendered) if rendered is not None else None
             outcome, reason = "eligible", None
             if retained is None or not normalized:
                 outcome, reason = "review", boundary_reason if retained is None else "empty_note_body"

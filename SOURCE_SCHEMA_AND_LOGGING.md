@@ -282,12 +282,24 @@ subject to the documented sandbox acceptance procedure before production.
 
 Raw bodies remain immutable. Rule `quoted-history-v1-window-8` runs first and
 only trims at one complete From/Sent-or-Date/To/Subject header block within an
-eight-line window. Rule `note-body-v1` then normalizes line endings, strips
+eight-line window. Rule `note-body-v2-email-subject` then renders each nonblank
+source subject for an `INBOUND_EMAIL` or `OUTBOUND_EMAIL` mapping as a leading
+plain-text `Subject: <source subject>` paragraph and one blank separator. Null
+and blank subjects leave the body unchanged. It does not invent or infer any
+other envelope field, suppress repeated subject text in the body, or add source
+IDs or migration labels. This preserves legitimate source content while making
+useful, real subject context visible on notes used because authoritative email
+envelope metadata is unavailable. The rule then normalizes line endings, strips
 trailing line whitespace, recognizes ordinary-whitespace and NBSP-only blank
 lines, collapses blank runs, and strips boundary blank lines. Ambiguous,
 conflicting, empty, and unreasonably short results are `review` outcomes.
 Ledgers/manifests retain only raw/transformed SHA-256 hashes, character counts,
 rule versions, and reason codes—not bodies, subjects, or addresses.
+
+Subject rendering precedes transformed body hashing, character counting,
+strict and potential duplicate comparison, CSV row hashing, and manifest
+generation. Consequently those values describe the exact visible export rather
+than the body before its subject was added.
 
 Strict duplicate rule `note-strict-v1` is equality of approved contact identity,
 target `NOTE`, exact normalized UTC timestamp, and canonical transformed body
@@ -299,3 +311,8 @@ checked before any optional read-only HubSpot discovery, and unknown or partial
 imports must be reconciled rather than retried. A rule or mapping change always
 creates a new immutable batch and fingerprints the mapping, source, selection,
 transformation, duplicate policy, and generated CSV.
+The version increment changes visible content and duplicate keys: never rewrite
+an existing `note-body-v1` batch or historical audit artifact. Any regeneration
+must create a new immutable batch, record `note-body-v2-email-subject`, the
+source/mapping fingerprints, cutoff and tool context, and the policy-change
+reason, and re-evaluate duplicate outcomes against the newly transformed body.

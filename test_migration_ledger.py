@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -21,6 +22,7 @@ from migration_ledger import (
     record_batch_state,
     reconcile_manual_import,
     record_stronger_confirmation,
+    render_email_subject,
     write_report,
     trim_quoted_history,
 )
@@ -41,13 +43,14 @@ class MigrationLedgerTests(unittest.TestCase):
               (contactId INTEGER, email TEXT, JobAdderOrganisationId INTEGER);
             CREATE TABLE JobAdderNotes
               (Id INTEGER, noteId INTEGER, type TEXT, source TEXT, text TEXT,
-               createdAt INTEGER, JobAdderOrganisationId INTEGER);
+               createdAt INTEGER, JobAdderOrganisationId INTEGER, subject TEXT);
             CREATE TABLE JobAdderNoteContacts
               (noteId INTEGER, contactId INTEGER, JobAdderOrganisationId INTEGER);
             CREATE TABLE JobAdderNoteTypes
               (name TEXT, JobAdderOrganisationId INTEGER);
             INSERT INTO JobAdderContacts VALUES (10, NULL, 1), (11, 'synthetic@example.test', 1);
-            INSERT INTO JobAdderNotes VALUES
+            INSERT INTO JobAdderNotes
+              (Id,noteId,type,source,text,createdAt,JobAdderOrganisationId) VALUES
               (100, 1000, 'Phone Call', 'User', 'synthetic', 1000, 1),
               (101, 1001, 'Phone Call', 'User', 'synthetic', 2000, 1);
             INSERT INTO JobAdderNoteContacts VALUES (1000, 10, 1), (1001, 11, 1);
@@ -102,6 +105,24 @@ class MigrationLedgerTests(unittest.TestCase):
         self.assertEqual(normalize_note_body(raw),
                          '  First, "quoted"\n\n- café\n- 東京')
 
+    def test_email_subject_rendering_rule_preserves_source_content(self):
+        body = 'Résumé, "quoted"\nSubject: déjà present\n東京'
+        rendered = render_email_subject(body, '  Café, "Q3" 東京  ',
+                                        "OUTBOUND_EMAIL")
+        self.assertEqual(
+            rendered,
+            'Subject:   Café, "Q3" 東京  \n\n'
+            'Résumé, "quoted"\nSubject: déjà present\n東京',
+        )
+        # Repeated subject text is source content, not a deduplication signal.
+        self.assertEqual(rendered.count('Café, "Q3" 東京'), 1)
+        repeated = render_email_subject("Same subject", "Same subject",
+                                        "INBOUND_EMAIL")
+        self.assertEqual(repeated, "Subject: Same subject\n\nSame subject")
+        for subject in (None, "", " \t"):
+            self.assertEqual(render_email_subject(body, subject, "INBOUND_EMAIL"), body)
+        self.assertEqual(render_email_subject(body, "Ignored", "NOTE"), body)
+
     def test_quoted_history_requires_one_complete_header_block(self):
         raw = ("Newest reply\r\n\r\nFrom: Older Person\r\nSent: Monday\r\n"
                "To: Recipient\r\nCc: Copy\r\nSubject: Old subject\r\nOld text")
@@ -117,12 +138,20 @@ class MigrationLedgerTests(unittest.TestCase):
                          ("review", "conflicting_quoted_history_boundaries"))
 
     def test_notes_csv_round_trip_and_strict_duplicate_ledger(self):
+        self.mapping.write_text(
+            "jobadder_type,jobadder_source,classification,reason\n"
+            "Phone Call,*,OUTBOUND_EMAIL,Synthetic email-like mapping\n",
+            encoding="utf-8",
+        )
         db = sqlite3.connect(self.source)
-        db.execute("UPDATE JobAdderNotes SET text=? WHERE Id=101",
+        db.execute("UPDATE JobAdderNotes SET text=?, subject=? WHERE Id=101",
                    ('Newest, "reply"  \r\n\r\n\u00a0\r\n- café\r\n\r\n'
-                    'From: Old\r\nSent: Yesterday\r\nTo: Person\r\nSubject: Earlier\r\nold',))
-        db.execute("INSERT INTO JobAdderNotes VALUES (102,1002,'Phone Call','User',?,2000,1)",
-                   ('Newest, "reply"\n\n- café',))
+                    'From: Old\r\nSent: Yesterday\r\nTo: Person\r\nSubject: Earlier\r\nold',
+                    'Résumé, "東京"'))
+        db.execute("""INSERT INTO JobAdderNotes
+                   (Id,noteId,type,source,text,createdAt,JobAdderOrganisationId,subject)
+                   VALUES (102,1002,'Phone Call','User',?,2000,1,?)""",
+                   ('Newest, "reply"\n\n- café', 'Résumé, "東京"'))
         db.execute("INSERT INTO JobAdderNoteContacts VALUES (1002,11,1)")
         db.commit(); db.close()
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
@@ -137,7 +166,7 @@ class MigrationLedgerTests(unittest.TestCase):
             rows = list(reader)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["Note body <NOTE hs_note_body>"],
-                         'Newest, "reply"\n\n- café')
+                         'Subject: Résumé, "東京"\n\nNewest, "reply"\n\n- café')
         self.assertEqual(rows[0]["Activity date <NOTE hs_timestamp>"],
                          "1970-01-01T00:00:02Z")
         ledger = open_ledger(self.ledger)
@@ -148,6 +177,14 @@ class MigrationLedgerTests(unittest.TestCase):
         self.assertEqual(len(duplicate["survivor_reference_sha256"]), 64)
         self.assertNotIn("Newest", dict(duplicate).values())
         ledger.close()
+        manifest = json.loads((directory / "manifest.json").read_text())
+        visible = rows[0]["Note body <NOTE hs_note_body>"]
+        self.assertEqual(manifest["body_transformation_version"],
+                         "note-body-v2-email-subject")
+        self.assertEqual(manifest["rows"][0]["transformed_character_count"],
+                         len(visible))
+        self.assertEqual(manifest["rows"][0]["transformed_body_sha256"],
+                         hashlib.sha256(visible.encode("utf-8")).hexdigest())
 
     def test_reports_aggregate_unmatched_by_type_and_date_range(self):
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
@@ -282,7 +319,9 @@ class MigrationLedgerTests(unittest.TestCase):
     def test_manual_import_confirms_only_when_totals_and_error_rows_reconcile(self):
         source = sqlite3.connect(self.source)
         source.execute("INSERT INTO JobAdderContacts VALUES (12, 'second@example.test', 1)")
-        source.execute("INSERT INTO JobAdderNotes VALUES (102, 1002, 'Phone Call', 'User', 'synthetic', 3000, 1)")
+        source.execute("""INSERT INTO JobAdderNotes
+                       (Id,noteId,type,source,text,createdAt,JobAdderOrganisationId)
+                       VALUES (102,1002,'Phone Call','User','synthetic',3000,1)""")
         source.execute("INSERT INTO JobAdderNoteContacts VALUES (1002, 12, 1)")
         source.commit()
         source.close()
@@ -440,7 +479,9 @@ class MigrationLedgerTests(unittest.TestCase):
 
     def test_sandbox_keeps_distinct_activities_with_identical_bodies(self):
         source = sqlite3.connect(self.source)
-        source.execute("INSERT INTO JobAdderNotes VALUES (102,1002,'Phone Call','User','synthetic',2000,1)")
+        source.execute("""INSERT INTO JobAdderNotes
+                       (Id,noteId,type,source,text,createdAt,JobAdderOrganisationId)
+                       VALUES (102,1002,'Phone Call','User','synthetic',2000,1)""")
         source.execute("INSERT INTO JobAdderNoteContacts VALUES (1002,11,1)")
         source.commit(); source.close()
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
