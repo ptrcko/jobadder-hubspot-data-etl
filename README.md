@@ -310,11 +310,23 @@ One invocation creates exactly one BOM-prefixed UTF-8 `notes.csv` with `Email
 <CONTACT email>`, `Note body <NOTE hs_note_body>`, and `Activity date <NOTE
 hs_timestamp>` in that order. Timestamps use normalized UTC ISO-8601 with a `Z`
 suffix, the representation approved for sandbox validation. The body is never
-labelled. Body transformation `note-body-v1` first detects quoted history on the
-immutable raw value, then converts CRLF/CR to LF, removes trailing line
+labelled. Body transformation `note-body-v2-email-subject` first detects quoted
+history on the immutable raw body. For `INBOUND_EMAIL` and `OUTBOUND_EMAIL`
+mappings only, a nonblank source subject is then rendered as a leading plain-text
+`Subject: <source subject>` paragraph, separated from the retained source body by
+one blank line. Blank or null subjects add nothing. The rule neither infers From,
+To, Cc, dates, or other envelope metadata nor removes body text when it repeats
+the subject; legitimate source content remains intact. It then converts CRLF/CR
+to LF, removes trailing line
 whitespace, treats whitespace-only (including NBSP-only) lines as blank,
 collapses blank runs to one blank line, and removes leading/trailing blank
 lines. Paragraphs, lists, Unicode, punctuation, and nonblank-line text remain.
+
+The business rationale is to retain meaningful email context while continuing
+to import email-like historical rows as notes when authoritative envelope data
+is unavailable. Subject rendering occurs before transformed hashing, character
+counting, strict/potential duplicate comparison, CSV row hashing, and manifest
+creation, so every audit value describes the exact visible note content.
 
 Quoted-history rule `quoted-history-v1-window-8` accepts only one `From:` line
 followed within eight lines by a coherent case-insensitive block containing
@@ -334,3 +346,9 @@ import a small reviewed batch into the HubSpot sandbox, validate formatting,
 chronology, and associations, then perform a repeat-run/no-duplicate acceptance
 check. Record only sanitized aggregate sandbox results; no sandbox approval is
 claimed by this repository.
+Because `note-body-v2-email-subject` changes visible content and duplicate keys,
+existing `note-body-v1` batches and historical audit artifacts must not be
+rewritten. Regeneration requires a new immutable batch and must record the new
+policy version, source and mapping fingerprints, cutoff/tool context, and the
+subject-policy change as its reason; prior duplicate decisions must be
+re-evaluated under the new transformed hashes.
