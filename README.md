@@ -104,8 +104,11 @@ quantities independently:
   each pair produces its own HubSpot activity.
 
 Generate a new batch directory (the command refuses an existing directory or a
-previously used batch ID). It prints the exact normalized selection and selected
-row/activity counts **before** creating the directory or CSV:
+previously used batch ID). A preflight message immediately reports how many
+importable pairs exist, how many are already represented by immutable batches,
+and how many remain. Source-reading progress is then reported every 5,000 pairs.
+Previously batched pairs are excluded in one ledger query rather than by one
+query per source pair, so a repeat run finishes promptly even for a large ledger:
 
 ```bash
 python migration_ledger.py generate-batch jobadder-history.db migration-ledger.db \
@@ -126,6 +129,13 @@ mapping hash, source-data fingerprint, generated CSV hash, row count,
 review metadata, HubSpot import name/ID and dates, result counts, and operator
 notes. The CSV and manifest are made read-only after successful generation.
 
+If no rows remain, the command exits successfully with zero counts and does not
+create a batch directory. This is a planning result—not an import batch—and most
+commonly means an earlier immutable batch already accounts for the selection.
+The returned counts distinguish importable pairs before prior-batch exclusion,
+previously batched pairs, and remaining pairs. Review those values before
+changing filters or generating a genuinely new batch.
+
 The audit manifest is a review and reconciliation sidecar only. Never submit it
 to HubSpot or combine its composite source keys with visible activity content.
 
@@ -140,7 +150,7 @@ without a classification filter:
 python .\migration_ledger.py generate-batch "..\jobadder-history" ".\ledger\migration-ledger.db" ".\batches\sandbox-all-notes-001" --batch-id "sandbox-all-notes-001" --environment "sandbox" --target-portal-label "YOUR-SANDBOX-PORTAL" --render-as-notes --operator-notes "All eligible JobAdder history rendered as HubSpot notes"
 ```
 
-`--render-as-notes` writes `NOTE` in every CSV `Activity type` cell. It does not
+`--render-as-notes` writes every selected item to the notes CSV. It does not
 change the controlled mapping or make `EXCLUDE`/`REVIEW` rows eligible: the
 original mapping decision and fingerprint remain in the ledger, and the manifest
 records `output_activity_type` as `NOTE`. Unresolved shared-email exceptions
