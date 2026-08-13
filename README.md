@@ -259,3 +259,44 @@ for the named sandbox portal and retain aggregate evidence that all items pass:
 ## Documentation authority
 
 Files under `HubspotDocs/` are reference snapshots and retain their copied “last updated” dates; for example, `format-import-files.md` says **August 6, 2026**, and `import-objects.md` says **July 22, 2026**. They are not authoritative for future runs. Before production, operators must verify the current official HubSpot documentation and test the actual target portal's import behavior, subscription limits, required fields, associations, and deduplication behavior.
+
+## Approved notes-only batch policy
+
+The production candidate path in `migration_ledger.py generate-batch` is the
+approved **notes-only-v1** policy. Every otherwise approved `NOTE`, `CALL`,
+`INBOUND_EMAIL`, and `OUTBOUND_EMAIL` source mapping is represented as a HubSpot
+note; the controlled mapping now classifies those rules as `NOTE`. Historical
+email-like note rows are not native email engagements because authoritative
+envelope metadata is unavailable. `EXCLUDE`, `REVIEW`, unknown, unmatched,
+ambiguous, and unapproved shared-email rows remain outside the file. Generation
+is dry-run planning only and is technically separate from recording a reviewed
+manual import submission.
+
+One invocation creates exactly one BOM-prefixed UTF-8 `notes.csv` with `Email
+<CONTACT email>`, `Note body <NOTE hs_note_body>`, and `Activity date <NOTE
+hs_timestamp>` in that order. Timestamps use normalized UTC ISO-8601 with a `Z`
+suffix, the representation approved for sandbox validation. The body is never
+labelled. Body transformation `note-body-v1` first detects quoted history on the
+immutable raw value, then converts CRLF/CR to LF, removes trailing line
+whitespace, treats whitespace-only (including NBSP-only) lines as blank,
+collapses blank runs to one blank line, and removes leading/trailing blank
+lines. Paragraphs, lists, Unicode, punctuation, and nonblank-line text remain.
+
+Quoted-history rule `quoted-history-v1-window-8` accepts only one `From:` line
+followed within eight lines by a coherent case-insensitive block containing
+`Sent:` or `Date:`, `To:`, and `Subject:` (with optional `Cc:`/`Bcc:`). Missing,
+conflicting, empty, or unreasonably short extraction is held for review. Strict
+duplicate policy `note-strict-v1` requires the same approved contact identity,
+`NOTE`, exact normalized timestamp, and canonical transformed-body hash. The
+stable `(organisation_id, source_activity_id, source_contact_id)` ordering picks
+the survivor. Same-content/different-time and same-time/different-content pairs
+are potential duplicates and are held for review; CSV import is not intrinsically
+idempotent.
+
+Every mapping, extraction, normalization, or duplicate-policy change requires a
+new immutable directory, batch ID, CSV, and manifest. Before production,
+generate a synthetic preview, parse the CSV (do not inspect it as plain text),
+import a small reviewed batch into the HubSpot sandbox, validate formatting,
+chronology, and associations, then perform a repeat-run/no-duplicate acceptance
+check. Record only sanitized aggregate sandbox results; no sandbox approval is
+claimed by this repository.

@@ -16,11 +16,13 @@ from migration_ledger import (
     importable_links,
     migration_counts,
     normalize_email,
+    normalize_note_body,
     open_ledger,
     record_batch_state,
     reconcile_manual_import,
     record_stronger_confirmation,
     write_report,
+    trim_quoted_history,
 )
 from hubspot_history_audit import open_read_only
 
@@ -95,6 +97,58 @@ class MigrationLedgerTests(unittest.TestCase):
             source.execute("CREATE TABLE forbidden_write (id INTEGER)")
         source.close()
 
+    def test_body_normalization_preserves_multiline_unicode_and_lists(self):
+        raw = "\r\n  First, \"quoted\"  \r\n\u00a0\r\n\r\n- café  \r\n- 東京\n\n"
+        self.assertEqual(normalize_note_body(raw),
+                         '  First, "quoted"\n\n- café\n- 東京')
+
+    def test_quoted_history_requires_one_complete_header_block(self):
+        raw = ("Newest reply\r\n\r\nFrom: Older Person\r\nSent: Monday\r\n"
+               "To: Recipient\r\nCc: Copy\r\nSubject: Old subject\r\nOld text")
+        retained, outcome, reason = trim_quoted_history(raw)
+        self.assertEqual(normalize_note_body(retained), "Newest reply")
+        self.assertEqual((outcome, reason),
+                         ("trimmed", "single_complete_header_block"))
+        prose = "A note\nFrom: this phrase is prose, not a mail header\nContinue"
+        self.assertEqual(trim_quoted_history(prose),
+                         (prose, "not_found", "no_complete_header_block"))
+        ambiguous = raw + "\nFrom: Again\nDate: Today\nTo: X\nSubject: Y"
+        self.assertEqual(trim_quoted_history(ambiguous)[1:],
+                         ("review", "conflicting_quoted_history_boundaries"))
+
+    def test_notes_csv_round_trip_and_strict_duplicate_ledger(self):
+        db = sqlite3.connect(self.source)
+        db.execute("UPDATE JobAdderNotes SET text=? WHERE Id=101",
+                   ('Newest, "reply"  \r\n\r\n\u00a0\r\n- café\r\n\r\n'
+                    'From: Old\r\nSent: Yesterday\r\nTo: Person\r\nSubject: Earlier\r\nold',))
+        db.execute("INSERT INTO JobAdderNotes VALUES (102,1002,'Phone Call','User',?,2000,1)",
+                   ('Newest, "reply"\n\n- café',))
+        db.execute("INSERT INTO JobAdderNoteContacts VALUES (1002,11,1)")
+        db.commit(); db.close()
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        directory = Path(self.temp.name) / "notes"
+        counts = generate_batch(self.source, self.ledger, directory, "notes-1")
+        self.assertEqual(counts["strict_duplicates_excluded"], 1)
+        with (directory / "notes.csv").open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            self.assertEqual(reader.fieldnames, [
+                "Email <CONTACT email>", "Note body <NOTE hs_note_body>",
+                "Activity date <NOTE hs_timestamp>"])
+            rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Note body <NOTE hs_note_body>"],
+                         'Newest, "reply"\n\n- café')
+        self.assertEqual(rows[0]["Activity date <NOTE hs_timestamp>"],
+                         "1970-01-01T00:00:02Z")
+        ledger = open_ledger(self.ledger)
+        duplicate = ledger.execute(
+            "SELECT * FROM note_processing WHERE outcome='duplicate'").fetchone()
+        self.assertEqual(duplicate["reason_code"],
+                         "strict_contact_timestamp_content_match")
+        self.assertEqual(len(duplicate["survivor_reference_sha256"]), 64)
+        self.assertNotIn("Newest", dict(duplicate).values())
+        ledger.close()
+
     def test_reports_aggregate_unmatched_by_type_and_date_range(self):
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
         output = Path(self.temp.name) / "preview.json"
@@ -142,18 +196,18 @@ class MigrationLedgerTests(unittest.TestCase):
 
         batch_dir = Path(self.temp.name) / "batch"
         generate_batch(self.source, self.ledger, batch_dir)
-        batch = batch_dir / "activities.csv"
+        batch = batch_dir / "notes.csv"
         manifest_path = batch_dir / "manifest.json"
         with batch.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(len(rows), 2)
         self.assertEqual(
-            {row["Contact email"] for row in rows},
+            {row["Email <CONTACT email>"] for row in rows},
             {"synthetic@example.test", "second@example.test"},
         )
-        self.assertTrue(all(len(row) == 4 for row in rows))
+        self.assertEqual(list(rows[0]), ["Email <CONTACT email>", "Note body <NOTE hs_note_body>", "Activity date <NOTE hs_timestamp>"])
         manifest = json.loads(manifest_path.read_text())
-        self.assertEqual(manifest["manifest_type"], "non_imported_audit_manifest")
+        self.assertEqual(manifest["manifest_type"], "non_imported_notes_audit_manifest")
         self.assertTrue(manifest["batch_id"])
         self.assertEqual(len(manifest["csv_sha256"]), 64)
         self.assertTrue(all(len(row["row_sha256"]) == 64 for row in manifest["rows"]))
@@ -197,9 +251,9 @@ class MigrationLedgerTests(unittest.TestCase):
             approve_shared_emails(self.ledger, decisions, False)
         self.assertEqual(approve_shared_emails(self.ledger, decisions, True), 2)
         generate_batch(self.source, self.ledger, batch, "synthetic-batch")
-        with (batch / "activities.csv").open(encoding="utf-8-sig", newline="") as handle:
+        with (batch / "notes.csv").open(encoding="utf-8-sig", newline="") as handle:
             self.assertEqual(
-                {row["Contact email"] for row in csv.DictReader(handle)},
+                {row["Email <CONTACT email>"] for row in csv.DictReader(handle)},
                 {"synthetic@example.test"},
             )
 
@@ -299,7 +353,8 @@ class MigrationLedgerTests(unittest.TestCase):
                 "date_to": "1970-01-01T00:00:02Z", "date_to_inclusive": True,
             }, operator_notes="synthetic fixture",
         )
-        self.assertEqual(counts, {"row_count": 1, "unique_source_activities": 1})
+        self.assertEqual(counts["row_count"], 1)
+        self.assertEqual(counts["unique_source_activities"], 1)
         manifest = json.loads((directory / "manifest.json").read_text())
         self.assertEqual(manifest["environment"], "test")
         self.assertEqual(manifest["target_portal_label"], "synthetic-sandbox")
@@ -309,7 +364,7 @@ class MigrationLedgerTests(unittest.TestCase):
         self.assertEqual(manifest["generated_file_hash"], manifest["csv_sha256"])
         self.assertEqual(manifest["selection_filters"]["email_sha256"],
                          [email_reference("synthetic@example.test")])
-        self.assertEqual((directory / "activities.csv").stat().st_mode & 0o222, 0)
+        self.assertEqual((directory / "notes.csv").stat().st_mode & 0o222, 0)
         with self.assertRaises(ValueError):
             generate_batch(self.source, self.ledger,
                            Path(self.temp.name) / "different-dir", "selection-1")

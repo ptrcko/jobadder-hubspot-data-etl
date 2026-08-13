@@ -271,3 +271,31 @@ The following remain unresolved:
 * Whether ambiguous email types become notes or remain in review.
 * Which timestamp representation the final HubSpot CSV will use after sandbox
   validation.
+
+## Notes-only transformation and duplicate audit contract
+
+The approved batch target is `NOTE` under policy `notes-only-approved-v1`.
+Email-like source notes are notes because authoritative envelope metadata is
+unavailable. The sole generated file has the three HubSpot headers documented
+in `README.md`; its activity date is normalized UTC ISO-8601 ending in `Z`,
+subject to the documented sandbox acceptance procedure before production.
+
+Raw bodies remain immutable. Rule `quoted-history-v1-window-8` runs first and
+only trims at one complete From/Sent-or-Date/To/Subject header block within an
+eight-line window. Rule `note-body-v1` then normalizes line endings, strips
+trailing line whitespace, recognizes ordinary-whitespace and NBSP-only blank
+lines, collapses blank runs, and strips boundary blank lines. Ambiguous,
+conflicting, empty, and unreasonably short results are `review` outcomes.
+Ledgers/manifests retain only raw/transformed SHA-256 hashes, character counts,
+rule versions, and reason codes—not bodies, subjects, or addresses.
+
+Strict duplicate rule `note-strict-v1` is equality of approved contact identity,
+target `NOTE`, exact normalized UTC timestamp, and canonical transformed body
+hash. The smallest stable composite source key survives; other members are
+ledgered as `duplicate` with reason
+`strict_contact_timestamp_content_match` and a hashed survivor reference.
+Potential/near matches are held for review. Local submitted/confirmed state is
+checked before any optional read-only HubSpot discovery, and unknown or partial
+imports must be reconciled rather than retried. A rule or mapping change always
+creates a new immutable batch and fingerprints the mapping, source, selection,
+transformation, duplicate policy, and generated CSV.
