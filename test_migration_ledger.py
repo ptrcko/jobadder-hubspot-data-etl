@@ -499,8 +499,32 @@ class MigrationLedgerTests(unittest.TestCase):
         record_batch_state(self.ledger, "first", "reviewed", reviewer="Reviewer")
         record_batch_state(self.ledger, "first", "submitted", import_id="sandbox-import",
                            operator="Operator")
-        with self.assertRaisesRegex(ValueError, "no importable rows"):
-            self._sandbox_collapsed_batch("second")
+        second = Path(self.temp.name) / "second"
+        counts = generate_batch(
+            self.source, self.ledger, second, "second",
+            environment="sandbox", target_portal_label="synthetic-sandbox",
+            render_as_notes=True, sandbox_collapse_by_email=True,
+        )
+        self.assertEqual(counts["row_count"], 0)
+        self.assertEqual(counts["importable_pairs_before_prior_batches"], 2)
+        self.assertEqual(counts["previously_batched_pairs_excluded"], 2)
+        self.assertEqual(counts["remaining_importable_pairs"], 0)
+        self.assertFalse(second.exists())
+
+    def test_batch_preflight_excludes_prior_rows_in_one_ledger_query(self):
+        discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)
+        self._sandbox_collapsed_batch("first")
+        ledger = open_ledger(self.ledger)
+        statements = []
+        ledger.set_trace_callback(statements.append)
+        remaining = list(importable_links(
+            ledger, exclude_previously_batched=True))
+        ledger.close()
+        self.assertEqual(remaining, [])
+        selects = [statement for statement in statements
+                   if statement.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(len(selects), 1)
+        self.assertIn("NOT EXISTS", selects[0])
 
     def test_sandbox_collapse_rejected_outside_sandbox_or_without_notes(self):
         discover(self.source, self.ledger, self.mapping, "2026-01-01T00:00:00Z", 1)

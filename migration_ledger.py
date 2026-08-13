@@ -16,6 +16,7 @@ import json
 import re
 import shutil
 import sqlite3
+import sys
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -265,6 +266,9 @@ def open_ledger(path: Path) -> sqlite3.Connection:
             FOREIGN KEY (batch_id, csv_row_number)
                 REFERENCES batch_rows(batch_id, csv_row_number)
         );
+        CREATE INDEX IF NOT EXISTS batch_row_sources_source_key
+            ON batch_row_sources
+               (organisation_id, source_activity_id, source_contact_id);
         CREATE TABLE IF NOT EXISTS import_reconciliations (
             id INTEGER PRIMARY KEY,
             batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -530,7 +534,8 @@ def migration_counts(connection: sqlite3.Connection) -> dict[str, int]:
 
 
 def importable_links(connection: sqlite3.Connection, selection: dict | None = None,
-                     *, statuses: set[str] | None = None):
+                     *, statuses: set[str] | None = None,
+                     exclude_previously_batched: bool = False):
     """Yield only links approved for normalized exact-email association.
 
     CSV generators must use this boundary rather than selecting ledger rows
@@ -558,6 +563,18 @@ def importable_links(connection: sqlite3.Connection, selection: dict | None = No
         clauses.append("activity_timestamp <= ?" if selection.get("date_to_inclusive", True)
                        else "activity_timestamp < ?")
         values.append(selection["date_to"])
+    if exclude_previously_batched:
+        clauses.append("""NOT EXISTS (
+            SELECT 1 FROM batch_rows br
+            WHERE br.organisation_id=activity_links.organisation_id
+              AND br.source_activity_id=activity_links.source_activity_id
+              AND br.source_contact_id=activity_links.source_contact_id
+            UNION ALL
+            SELECT 1 FROM batch_row_sources bs
+            WHERE bs.organisation_id=activity_links.organisation_id
+              AND bs.source_activity_id=activity_links.source_activity_id
+              AND bs.source_contact_id=activity_links.source_contact_id
+        )""")
     extra = " AND " + " AND ".join(clauses) if clauses else ""
     return connection.execute(
         f"""SELECT * FROM activity_links
@@ -685,17 +702,23 @@ def generate_batch(
             links = list(importable_links(
                 ledger, selection,
                 statuses=IMPORTABLE_STATUSES | {"shared_email_exception"},
+                exclude_previously_batched=True,
             ))
         else:
-            links = list(importable_links(ledger, selection))
-        # A source pair already in an immutable batch cannot silently enter another.
-        links = [link for link in links if not ledger.execute(
-            """SELECT 1 FROM batch_rows WHERE organisation_id=?
-               AND source_activity_id=? AND source_contact_id=?
-               UNION SELECT 1 FROM batch_row_sources WHERE organisation_id=?
-               AND source_activity_id=? AND source_contact_id=?""",
-            (*_source_key(link), *_source_key(link)),
-        ).fetchone()]
+            links = list(importable_links(
+                ledger, selection, exclude_previously_batched=True))
+        eligible_before_prior_batches = sum(1 for _ in importable_links(
+            ledger, selection,
+            statuses=(IMPORTABLE_STATUSES | {"shared_email_exception"}
+                      if sandbox_collapse_by_email else IMPORTABLE_STATUSES),
+        ))
+        previously_batched = eligible_before_prior_batches - len(links)
+        print(
+            f"Batch preflight: {eligible_before_prior_batches} importable pair(s); "
+            f"{previously_batched} already in immutable batches; "
+            f"{len(links)} remaining to process.",
+            file=sys.stderr, flush=True,
+        )
         selected_emails = {normalize_email(item) for item in selection.get("emails", [])}
         selected_emails.discard(None)
         if selection.get("emails") and len(selected_emails) != len(selection["emails"]):
@@ -706,7 +729,10 @@ def generate_batch(
         candidates = []
         held_trim = 0
         mapping_hashes = set()
-        for link in links:
+        for link_number, link in enumerate(links, 1):
+            if link_number == 1 or link_number % 5000 == 0:
+                print(f"Reading source activities: {link_number}/{len(links)}",
+                      file=sys.stderr, flush=True)
             row = source.execute(
                 """SELECT c.email, n.subject, n.text FROM JobAdderNotes n
                 JOIN JobAdderNoteContacts nc ON nc.JobAdderOrganisationId=n.JobAdderOrganisationId
@@ -838,6 +864,9 @@ def generate_batch(
                 "SELECT COUNT(*) FROM activity_links WHERE status NOT IN ('approved_email_match','shared_email_policy_approved')").fetchone()[0],
             "collapsed_source_rows": collapsed_source_rows,
             "pre_collapse_eligible_rows": len(candidates) + collapsed_source_rows,
+            "importable_pairs_before_prior_batches": eligible_before_prior_batches,
+            "previously_batched_pairs_excluded": previously_batched,
+            "remaining_importable_pairs": len(links),
         }
         # Persist every considered pair, including review and duplicate outcomes,
         # even when no candidate CSV can safely be created.
@@ -858,9 +887,13 @@ def generate_batch(
                         (item["outcome"], item["reason"], link["organisation_id"],
                          link["source_contact_id"], link["source_activity_id"]))
         # Aggregate and fingerprints only: no body, address, subject, or local path.
-        print(json.dumps({"selection_fingerprint": selection_fingerprint, "counts": counts}, sort_keys=True))
         if not emitted:
-            raise ValueError("selection produced no importable rows; no batch was created")
+            # An empty selection is a valid, useful planning result. In particular,
+            # a repeat run should report that immutable batches already account for
+            # every source pair rather than spending minutes and then failing.
+            print("No batch created because no rows remain eligible for emission.",
+                  file=sys.stderr, flush=True)
+            return counts
         if len(mapping_hashes) != 1:
             raise ValueError("selection spans zero or multiple mapping hashes; rediscover first")
         batch_directory.mkdir(parents=False)
