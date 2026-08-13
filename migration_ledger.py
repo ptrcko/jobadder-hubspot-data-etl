@@ -516,7 +516,7 @@ def generate_batch(
     source_path: Path, ledger_path: Path, batch_directory: Path,
     batch_id: str | None = None, *, environment: str = "sandbox",
     target_portal_label: str = "unspecified", selection: dict | None = None,
-    operator_notes: str | None = None,
+    operator_notes: str | None = None, render_as_notes: bool = False,
 ) -> dict[str, int]:
     """Create a reviewed candidate CSV and its non-imported row audit manifest.
 
@@ -562,6 +562,7 @@ def generate_batch(
             "date_from_inclusive": selection.get("date_from_inclusive", True),
             "date_to": selection.get("date_to"),
             "date_to_inclusive": selection.get("date_to_inclusive", True),
+            "output_activity_type": "NOTE" if render_as_notes else "source_mapping",
         }
         selected_counts = {
             "row_count": len(links),
@@ -610,7 +611,11 @@ def generate_batch(
                     raise ValueError("source email changed after planning; rediscover before batching")
                 output_row = {
                     "Contact email": normalized_email,
-                    "Activity type": link["mapping_decision"],
+                    # JobAdder represents all of these history items as notes. The
+                    # mapping decision remains in the ledger for selection and
+                    # audit, while this explicit mode renders every eligible item
+                    # for a single HubSpot Notes import.
+                    "Activity type": "NOTE" if render_as_notes else link["mapping_decision"],
                     "Activity timestamp": link["activity_timestamp"],
                     "Activity body": source_row["text"] or "",
                 }
@@ -909,6 +914,10 @@ def parse_args() -> argparse.Namespace:
     batch.add_argument("--date-to")
     batch.add_argument("--date-to-exclusive", action="store_true")
     batch.add_argument("--operator-notes")
+    batch.add_argument(
+        "--render-as-notes", action="store_true",
+        help="render every selected importable activity as NOTE without changing its audited mapping",
+    )
     state = commands.add_parser("record-batch-state")
     state.add_argument("ledger", type=Path)
     state.add_argument("batch_id")
@@ -972,7 +981,8 @@ def main() -> int:
         print(json.dumps(generate_batch(
             args.database, args.ledger, args.batch_directory, args.batch_id,
             environment=args.environment, target_portal_label=args.target_portal_label,
-            selection=selection, operator_notes=args.operator_notes)))
+            selection=selection, operator_notes=args.operator_notes,
+            render_as_notes=args.render_as_notes)))
     return 0
 
 
